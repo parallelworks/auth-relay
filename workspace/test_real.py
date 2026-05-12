@@ -1,17 +1,27 @@
-"""Self-contained workspace-side smoke test (iter 2).
+"""Workspace-side real-ceremony test (iter 2): make_credential + get_assertion.
 
-Bundles the length-prefixed byte framing inline so this file can be scp'd or
-piped to the workspace as a single artifact. Requires python-fido2 to be
-installed on the workspace (pip install --user fido2).
+Standalone (vendors the framing inline) so it can be scp'd or piped to the
+workspace as a single file. Requires python-fido2 on the workspace
+(pip install --user fido2).
 
-Runs only no-touch operations so it can be used for latency / routing
-validation without the user touching the YubiKey on the laptop. The full
-make_credential / get_assertion ceremony is in workspace/test_real.py.
+What it does, end-to-end:
+
+  1. Connect to the relay socket (which terminates at the laptop agent via
+     pw ssh -R).
+  2. authenticatorGetInfo — read real metadata from the laptop's YubiKey.
+  3. authenticatorMakeCredential against rp_id=demo.parallel.works.
+     -> The laptop YubiKey blinks. Touch it within ~30s.
+  4. authenticatorGetAssertion using the credential just minted.
+     -> Blinks again. Touch it.
+
+The rp_id is intentionally a test value, not accounts.google.com — wiring a
+real-RP ceremony to a browser is iter 3 (CDP virtual authenticator).
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import struct
 import sys
@@ -19,9 +29,18 @@ import time
 
 from fido2.ctap import CtapDevice
 from fido2.ctap2 import Ctap2
+from fido2.cose import ES256
 from fido2.hid import CAPABILITY, CTAPHID
 
 MAX_FRAME_BYTES = 1 << 20
+
+DEMO_RP = {"id": "demo.parallel.works", "name": "PW YubiKey Relay Demo"}
+DEMO_USER = {
+    "id": b"\x01" * 16,
+    "name": "demo@parallel.works",
+    "displayName": "Demo User",
+}
+ES256_PARAM = {"type": "public-key", "alg": ES256.ALGORITHM}
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
@@ -91,7 +110,10 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"[workspace] hostname={socket.gethostname()} connecting to {args.host}:{args.port}")
+    # No socket timeout on read — make_credential blocks on the user's physical touch
+    # at the laptop, which can take many seconds.
     with socket.create_connection((args.host, args.port), timeout=10) as sock:
+        sock.settimeout(None)
         print(f"[workspace] connected (local={sock.getsockname()} peer={sock.getpeername()})")
         device = SocketCtapDevice(sock)
         ctap2 = Ctap2(device)
@@ -99,24 +121,38 @@ def main() -> int:
         info = ctap2.info
         print(f"[info]            aaguid={info.aaguid.hex()}")
         print(f"[info]            versions={info.versions}")
-        print(f"[info]            extensions={info.extensions}")
-        print(f"[info]            transports={info.transports}")
-        print(f"[info]            options={info.options}")
 
-        timings: list[float] = []
-        for i in range(20):
-            t0 = time.perf_counter()
-            ctap2.get_info()
-            timings.append((time.perf_counter() - t0) * 1000.0)
-        timings.sort()
-        median = timings[len(timings) // 2]
-        p95 = timings[int(len(timings) * 0.95)]
-        print(
-            f"[get_info x20]    min={timings[0]:.1f}  median={median:.1f}  "
-            f"p95={p95:.1f}  max={timings[-1]:.1f}  ms"
+        client_data_hash_mc = os.urandom(32)
+        print("[make_credential] sending request — TOUCH YOUR YUBIKEY on the laptop now")
+        t0 = time.perf_counter()
+        att = ctap2.make_credential(
+            client_data_hash_mc,
+            DEMO_RP,
+            DEMO_USER,
+            [ES256_PARAM],
         )
+        dt = (time.perf_counter() - t0) * 1000.0
+        cred_data = att.auth_data.credential_data
+        cred_id = cred_data.credential_id
+        print(f"[make_credential] {dt:7.1f} ms  (includes physical touch latency)")
+        print(f"[make_credential] credential_id ({len(cred_id)} bytes): {cred_id.hex()}")
+        print(f"[make_credential] aaguid: {cred_data.aaguid.hex()}")
+        print(f"[make_credential] fmt: {att.fmt}")
 
-    print("[workspace] OK — relay carries real CTAP2 end-to-end (no touch required)")
+        client_data_hash_ga = os.urandom(32)
+        print("[get_assertion]   sending request — TOUCH YOUR YUBIKEY again")
+        t0 = time.perf_counter()
+        assertion = ctap2.get_assertion(
+            DEMO_RP["id"],
+            client_data_hash_ga,
+            [{"type": "public-key", "id": cred_id}],
+        )
+        dt = (time.perf_counter() - t0) * 1000.0
+        print(f"[get_assertion]   {dt:7.1f} ms")
+        print(f"[get_assertion]   signature ({len(assertion.signature)} bytes): {assertion.signature.hex()[:64]}...")
+        print(f"[get_assertion]   signCount: {assertion.auth_data.counter}")
+
+    print("[workspace] OK — real CTAP2 ceremony completed through pw ssh -R relay")
     return 0
 
 
