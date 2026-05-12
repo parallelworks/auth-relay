@@ -166,8 +166,19 @@ cmd_up() {
       exit 1
     fi
     if ! is_running "$PID_TUNNEL"; then
-      err "tunnel exited; tail $LOG_TUNNEL"
-      sed -n '1,30p' "$LOG_TUNNEL" >&2 || true
+      # Surface specific known failure patterns clearly. Never tell users to
+      # kill a remote `pw` process — that's their cluster's per-user agent.
+      if grep -q "remote port forwarding failed for listen port" "$LOG_TUNNEL" 2>/dev/null; then
+        err "remote port ${PORT} is already bound by another process on the cluster."
+        err "common cause: a previous pwrelay session left a stale ssh -R holding the port."
+        err "to clean it up: pw ssh <resource> 'pgrep -u \$USER -af \"sleep 86400\" | awk \"{print \\\$1}\" | xargs -r kill'"
+        err "DO NOT kill any process named 'pw agent' on the remote — that's your cluster's per-user daemon."
+      elif grep -q "Permission denied (publickey)" "$LOG_TUNNEL" 2>/dev/null; then
+        err "ssh public-key auth refused. \`pw auth login\` to refresh, then retry."
+      else
+        err "tunnel exited; tail $LOG_TUNNEL"
+        sed -n '1,30p' "$LOG_TUNNEL" >&2 || true
+      fi
       cmd_down >/dev/null 2>&1 || true
       exit 1
     fi

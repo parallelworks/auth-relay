@@ -115,6 +115,15 @@ Check `pw auth whoami` and `~/.ssh/pwcli`. Re-run `pw auth login` if either
 is stale. The `--ProxyCommand="pw ssh --proxy-command %h"` SSH chain
 requires both.
 
+**`pwrelay up` says "remote port 7777 is already bound by another process"**
+A prior pwrelay session left an `ssh -R ... sleep 86400` running on the
+cluster login node. The new pwrelay can't reuse the port. Recovery:
+`pw ssh <resource> 'pgrep -u $USER -af "sleep 86400" | awk "{print \$1}" | xargs -r kill'`.
+**Do not** kill any process named `pw agent` on the cluster — that's
+your cluster's per-user daemon. Killing it makes `pw ssh <resource>` fail
+auth, and you'll need PW support (or a web SSH into the login node) to
+re-bootstrap your agent.
+
 **Extension console says `attach() failed: webAuthenticationProxy is undefined`**
 You need Chrome (or Chromium) 115 or newer. Check `chrome://version`.
 
