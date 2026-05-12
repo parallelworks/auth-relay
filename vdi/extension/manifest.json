@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "PW YubiKey Relay",
+  "version": "0.3.0",
+  "description": "Forwards WebAuthn (navigator.credentials) calls to a YubiKey relay agent on the user's laptop. Iter 3 of NOAA YubiKey relay POC.",
+  "permissions": ["webAuthenticationProxy", "nativeMessaging", "tabs", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "minimum_chrome_version": "115"
+}

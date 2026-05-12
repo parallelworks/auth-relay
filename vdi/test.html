@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>PW YubiKey Relay — iter 3 test</title>
+  <style>
+    body { font: 14px/1.5 -apple-system, system-ui, sans-serif; max-width: 780px; margin: 20px auto; padding: 0 20px; color: #222; }
+    h1 { font-size: 18px; margin: 1.2em 0 .4em; }
+    button { font: inherit; padding: 8px 14px; margin: 4px 6px 4px 0; cursor: pointer; }
+    pre { background: #f4f4f4; border: 1px solid #ddd; padding: 10px; overflow: auto; white-space: pre-wrap; word-wrap: break-word; }
+    .ok { color: #0a6; }
+    .err { color: #c30; }
+    .muted { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>PW YubiKey Relay — iter 3 test page</h1>
+  <p class="muted">
+    Origin: <code id="origin"></code><br>
+    This page calls <code>navigator.credentials.create()</code> and
+    <code>.get()</code> against a fake RP. If the extension is installed
+    and attached, the calls route through the relay to your laptop YubiKey.
+    No real account is at risk.
+  </p>
+
+  <button id="btn-create">1. Make credential (touch needed)</button>
+  <button id="btn-get" disabled>2. Get assertion (touch needed)</button>
+  <button id="btn-clear">Clear log</button>
+
+  <h1>Log</h1>
+  <pre id="log"></pre>
+
+<script>
+  const logEl = document.getElementById("log");
+  document.getElementById("origin").textContent = location.origin;
+
+  function log(msg, cls) {
+    const time = new Date().toISOString().slice(11, 23);
+    const line = `[${time}] ${msg}`;
+    const span = document.createElement("span");
+    if (cls) span.className = cls;
+    span.textContent = line + "\n";
+    logEl.appendChild(span);
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(line);
+  }
+
+  document.getElementById("btn-clear").onclick = () => { logEl.textContent = ""; };
+
+  // Persist the last credential id across button clicks.
+  let lastCredId = null;
+
+  function bytesToB64Url(buf) {
+    const u8 = new Uint8Array(buf);
+    let s = "";
+    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function b64UrlToBytes(s) {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    const bin = atob(s);
+    const u = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+    return u;
+  }
+
+  function randomBytes(n) {
+    const u = new Uint8Array(n);
+    crypto.getRandomValues(u);
+    return u;
+  }
+
+  document.getElementById("btn-create").onclick = async () => {
+    try {
+      const challenge = randomBytes(32);
+      const userId = randomBytes(16);
+      const options = {
+        challenge,
+        rp: { id: "localhost", name: "PW YubiKey Relay Demo" },
+        user: { id: userId, name: "demo@parallel.works", displayName: "Demo User" },
+        pubKeyCredParams: [
+          { type: "public-key", alg: -7 },   // ES256
+          { type: "public-key", alg: -257 }, // RS256
+        ],
+        timeout: 90000,
+        authenticatorSelection: { userVerification: "discouraged" },
+        attestation: "direct",
+      };
+      log(`create() rp=${options.rp.id} challenge=${bytesToB64Url(challenge).slice(0, 16)}... — TOUCH YOUR LAPTOP YUBIKEY`);
+      const t0 = performance.now();
+      const cred = await navigator.credentials.create({ publicKey: options });
+      const dt = (performance.now() - t0).toFixed(1);
+      lastCredId = new Uint8Array(cred.rawId);
+      log(`create() OK in ${dt} ms`, "ok");
+      log(`  id           = ${cred.id}`);
+      log(`  rawId.length = ${lastCredId.length}`);
+      log(`  type         = ${cred.type}`);
+      log(`  clientDataJSON = ${new TextDecoder().decode(cred.response.clientDataJSON)}`);
+      log(`  attestationObject.length = ${cred.response.attestationObject.byteLength}`);
+      log(`  attestationObject (b64url 1st 80) = ${bytesToB64Url(cred.response.attestationObject).slice(0, 80)}...`);
+      document.getElementById("btn-get").disabled = false;
+    } catch (err) {
+      log(`create() FAILED: ${err && err.name}: ${err && err.message}`, "err");
+      console.error(err);
+    }
+  };
+
+  document.getElementById("btn-get").onclick = async () => {
+    if (!lastCredId) {
+      log("no credential to assert against; run create() first", "err");
+      return;
+    }
+    try {
+      const challenge = randomBytes(32);
+      const options = {
+        challenge,
+        rpId: location.hostname || "demo.parallel.works",
+        allowCredentials: [{ type: "public-key", id: lastCredId }],
+        timeout: 90000,
+        userVerification: "discouraged",
+      };
+      log(`get() rpId=${options.rpId} — TOUCH YOUR LAPTOP YUBIKEY`);
+      const t0 = performance.now();
+      const assertion = await navigator.credentials.get({ publicKey: options });
+      const dt = (performance.now() - t0).toFixed(1);
+      log(`get() OK in ${dt} ms`, "ok");
+      log(`  id                = ${assertion.id}`);
+      log(`  authenticatorData = ${bytesToB64Url(assertion.response.authenticatorData).slice(0, 80)}...`);
+      log(`  signature         = ${bytesToB64Url(assertion.response.signature).slice(0, 80)}...`);
+      log(`  signature.length  = ${assertion.response.signature.byteLength}`);
+      log(`  userHandle        = ${assertion.response.userHandle ? bytesToB64Url(assertion.response.userHandle) : "null"}`);
+    } catch (err) {
+      log(`get() FAILED: ${err && err.name}: ${err && err.message}`, "err");
+      console.error(err);
+    }
+  };
+
+  log("ready. extension must be installed and chrome.webAuthenticationProxy.attach() must have succeeded.");
+</script>
+</body>
+</html>
