@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "PW YubiKey Relay",
-  "version": "0.3.0",
-  "description": "Forwards WebAuthn (navigator.credentials) calls to a YubiKey relay agent on the user's laptop. Iter 3 of NOAA YubiKey relay POC.",
+  "version": "0.4.0",
+  "description": "Forwards WebAuthn (navigator.credentials) calls to a YubiKey relay agent on the user's laptop.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2O5mNOK95GgrGQIu5r+mMhL/ObQlkP6drCOgYzfdZwLn7JTpQm4wczmuIXvrlAwYLqWmFlP3oYvyc0x83O/Moya0txeoYzwJeJUYC62yCSFBXyx7EuHvsPdqe21qOCKKl4ISGpi+51TFGqMF1UsQBWgH07dLtgshcP/o1xKddVYQI/gimfzwKIKIlOQ/aq12mJKHx+B7rtv/zGcbNKG2wGAixauJq0AHNkphHNNC7fFgXJc1GDhe/V1f4wlTA/3RZFCMq82aL9dwbtiFV8JbR1kbO/3kLgPVyjM5XudwcpO6DYXlC9seGpV/eK+S8VUwGek55PoCdsdDDJ6wgMqVPwIDAQAB",
   "permissions": ["webAuthenticationProxy", "nativeMessaging", "tabs", "storage"],
   "background": {
     "service_worker": "background.js"

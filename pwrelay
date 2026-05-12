@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# pwrelay — laptop-side CLI for the PW YubiKey Relay.
+#
+# One command brings up the agent + pw ssh -R tunnel to your PW resource.
+# Foreground; Ctrl+C cleans up. Logs go to stderr (tee'd from agent.py).
+#
+# Usage:
+#   ./pwrelay setup                    one-time: deps + venv + key check
+#   ./pwrelay up <resource>            start agent + tunnel; stays foreground
+#   ./pwrelay status                   show what (if anything) is running
+#   ./pwrelay down                     stop any running agent/tunnel
+#
+# Examples:
+#   ./pwrelay up workspace
+#   ./pwrelay up gclusternoaav3
+#   ./pwrelay up pw://Matthew.Shaxted/gclusternoaav3
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+VENV="$HERE/.venv"
+PORT="${PW_RELAY_PORT:-7777}"
+PID_AGENT="/tmp/pwrelay-agent.pid"
+PID_TUNNEL="/tmp/pwrelay-tunnel.pid"
+LOG_AGENT="/tmp/pwrelay-agent.log"
+LOG_TUNNEL="/tmp/pwrelay-tunnel.log"
+
+color()  { tput setaf "$1" 2>/dev/null || true; }
+reset()  { tput sgr0 2>/dev/null || true; }
+say()    { printf '%s%s%s\n' "$(color 6)[pwrelay]$(reset) " "$*" ""; }
+err()    { printf '%s%s%s\n' "$(color 1)[pwrelay error]$(reset) " "$*" "" >&2; }
+ok()     { printf '%s%s%s\n' "$(color 2)[pwrelay ok]$(reset) " "$*" ""; }
+
+die() { err "$*"; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 not on PATH"; }
+
+# ---- setup -----------------------------------------------------------------
+
+cmd_setup() {
+  need_cmd python3
+  need_cmd pw
+  need_cmd ssh
+
+  # Match the user's pw auth state.
+  pw auth whoami >/dev/null 2>&1 || die "pw CLI not authenticated. Run: pw auth login"
+
+  [[ -f "$HOME/.ssh/pwcli" ]] || die "~/.ssh/pwcli missing. Run: pw auth login"
+
+  if [[ ! -d "$VENV" ]]; then
+    say "creating venv at $VENV"
+    python3 -m venv "$VENV"
+  fi
+
+  # shellcheck source=/dev/null
+  source "$VENV/bin/activate"
+
+  if ! python3 -c 'import fido2' >/dev/null 2>&1; then
+    say "installing python-fido2 into venv"
+    python3 -m pip install --upgrade pip >/dev/null
+    python3 -m pip install fido2 >/dev/null
+  fi
+
+  # Probe the key — non-fatal if missing, but warn loudly.
+  if python3 -c 'from fido2.hid import CtapHidDevice; assert list(CtapHidDevice.list_devices())' 2>/dev/null; then
+    ok "YubiKey detected"
+  else
+    err "no FIDO2 USB device found right now (plug it in before \`pwrelay up\`)"
+  fi
+
+  ok "setup complete"
+}
+
+# ---- runtime helpers -------------------------------------------------------
+
+ensure_venv() {
+  [[ -d "$VENV" ]] || die "venv not found. Run: ./pwrelay setup"
+  # shellcheck source=/dev/null
+  source "$VENV/bin/activate"
+}
+
+is_running() {
+  local pid_file="$1"
+  [[ -f "$pid_file" ]] || return 1
+  local pid; pid=$(cat "$pid_file" 2>/dev/null || true)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+stop_pid() {
+  local pid_file="$1" name="$2"
+  if is_running "$pid_file"; then
+    local pid; pid=$(cat "$pid_file")
+    say "stopping $name (pid $pid)"
+    kill "$pid" 2>/dev/null || true
+    # Give it 2s to exit, then SIGKILL.
+    for _ in 1 2 3 4; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+}
+
+resolve_resource() {
+  # Accept short, full, or pw:// forms. Default to "workspace".
+  local r="${1:-workspace}"
+  printf '%s' "$r"
+}
+
+resource_user() {
+  # The user portion for the inner ssh. pw CLI itself runs as the caller's
+  # account; the SSH inside the proxy needs the resource's owner. We default
+  # to `pw auth whoami` which is the caller; that works for the user's own
+  # resources. Override with PW_RESOURCE_USER=<name> if connecting to a
+  # resource owned by someone else who's granted you access.
+  if [[ -n "${PW_RESOURCE_USER:-}" ]]; then
+    printf '%s' "$PW_RESOURCE_USER"
+    return
+  fi
+  pw auth whoami 2>/dev/null
+}
+
+# ---- up --------------------------------------------------------------------
+
+cmd_up() {
+  local resource; resource=$(resolve_resource "${1:-}")
+  ensure_venv
+
+  if is_running "$PID_AGENT"; then
+    say "agent already running (pid $(cat "$PID_AGENT")). Use \`pwrelay down\` to stop."
+    exit 1
+  fi
+
+  # Agent.
+  say "starting agent on 127.0.0.1:${PORT}"
+  python3 "$HERE/laptop/agent.py" --port "$PORT" >"$LOG_AGENT" 2>&1 &
+  echo $! > "$PID_AGENT"
+  sleep 0.6
+  if ! is_running "$PID_AGENT"; then
+    err "agent failed to start; tail $LOG_AGENT"
+    sed -n '1,20p' "$LOG_AGENT" >&2 || true
+    exit 1
+  fi
+  ok "agent listening on 127.0.0.1:${PORT}"
+
+  # Tunnel.
+  local rs_user; rs_user=$(resource_user)
+  say "opening reverse tunnel via pw ssh to $resource ($rs_user@$resource)"
+  ssh -i "$HOME/.ssh/pwcli" \
+      -o ProxyCommand="pw ssh --proxy-command %h" \
+      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
+      -R "${PORT}:127.0.0.1:${PORT}" \
+      "${rs_user}@${resource}" \
+      'echo "[remote] tunnel-up on $(hostname); pid=$$"; exec sleep 86400' \
+      >"$LOG_TUNNEL" 2>&1 &
+  echo $! > "$PID_TUNNEL"
+
+  # Wait for the tunnel-up line.
+  local waited=0
+  while ! grep -q "tunnel-up on" "$LOG_TUNNEL" 2>/dev/null; do
+    sleep 0.5
+    waited=$((waited + 1))
+    if [[ $waited -gt 30 ]]; then
+      err "tunnel didn't come up in 15s; tail $LOG_TUNNEL"
+      sed -n '1,30p' "$LOG_TUNNEL" >&2 || true
+      cmd_down >/dev/null 2>&1 || true
+      exit 1
+    fi
+    if ! is_running "$PID_TUNNEL"; then
+      err "tunnel exited; tail $LOG_TUNNEL"
+      sed -n '1,30p' "$LOG_TUNNEL" >&2 || true
+      cmd_down >/dev/null 2>&1 || true
+      exit 1
+    fi
+  done
+  local rhost; rhost=$(grep -m1 "tunnel-up on" "$LOG_TUNNEL" | sed 's/.*tunnel-up on //; s/;.*//')
+  ok "tunnel up to $rhost — port ${PORT} on remote -> agent on this laptop"
+
+  cat <<EOF
+
+────────────────────────────────────────────────────────────────────
+ Relay live. On the VDI side (one-time per session):
+   bash <path-to-this-repo>/vdi/bootstrap.sh   (or just open Chrome
+   if extension and NMH manifest are already installed)
+ Then open http://localhost:8080/test.html in the VDI Chrome.
+ Ctrl+C here tears down the agent and tunnel cleanly.
+────────────────────────────────────────────────────────────────────
+
+EOF
+
+  # Forward signals; tail the agent log so the user sees activity.
+  trap 'echo; cmd_down; exit 0' INT TERM
+  tail -F "$LOG_AGENT" 2>/dev/null
+}
+
+# ---- down ------------------------------------------------------------------
+
+cmd_down() {
+  stop_pid "$PID_TUNNEL" "ssh tunnel"
+  stop_pid "$PID_AGENT" "agent"
+  ok "relay stopped"
+}
+
+# ---- status ----------------------------------------------------------------
+
+cmd_status() {
+  if is_running "$PID_AGENT"; then
+    ok "agent: running (pid $(cat "$PID_AGENT"))"
+  else
+    say "agent: not running"
+  fi
+  if is_running "$PID_TUNNEL"; then
+    ok "tunnel: running (pid $(cat "$PID_TUNNEL"))"
+    grep "tunnel-up on" "$LOG_TUNNEL" 2>/dev/null | tail -1
+  else
+    say "tunnel: not running"
+  fi
+}
+
+# ---- entry -----------------------------------------------------------------
+
+case "${1:-}" in
+  setup)    shift; cmd_setup "$@" ;;
+  up)       shift; cmd_up "$@" ;;
+  down|stop) cmd_down ;;
+  status)   cmd_status ;;
+  ""|-h|--help|help)
+    sed -n '2,15p' "$0" ;;
+  *)
+    err "unknown subcommand: $1"
+    sed -n '2,15p' "$0" >&2
+    exit 1
+    ;;
+esac

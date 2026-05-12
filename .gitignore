@@ -10,3 +10,4 @@ env/
 /tmp/
 .idea/
 .vscode/
+vdi/extension/.private-key.pem

@@ -1,162 +1,175 @@
-# NOAA YubiKey Relay — iteration 2
+# NOAA YubiKey Relay
 
-Userspace relay that lets a YubiKey plugged into a user's laptop service real
-WebAuthn / FIDO2 (CTAP2) requests originating on a remote PW ACTIVATE session,
-without USB forwarding, kernel modules, or root anywhere.
+Use the YubiKey plugged into your **laptop** to complete WebAuthn / FIDO2
+prompts (Google MFA, GitHub, anything that uses `navigator.credentials`)
+inside a Parallel Works ACTIVATE **remote desktop** session — without USB
+forwarding, kernel modules, browser plugins from a store, or root anywhere.
 
-Iter 2 carries **real CTAP2 traffic** through a `pw ssh -R` reverse tunnel
-between a laptop and a PW session. Wire payload is the raw CTAPHID CBOR frame
-body (CTAP2 cmd byte + CBOR), piped straight through python-fido2 to the
-physical key. Real `make_credential` / `get_assertion` ceremonies complete
-end-to-end with a physical touch on the laptop.
+No raw USB. No `uinput`. No `pcscd`. No system daemons. The whole thing is
+$HOME-only on both sides and rides the existing `pw ssh -R` channel.
 
-A browser inside the VDI consuming this relay (via a CDP virtual authenticator
-harness) is iteration 3.
+## Quickstart (5 minutes the first time, ~30 seconds per session after that)
 
-## Layout
-
-```
-common/protocol.py         length-prefixed byte-frame framing
-laptop/agent.py            laptop-side TCP server, python-fido2 backend
-workspace/client.py        workspace-side client, no-touch get_info loop for timing
-workspace/standalone_test.py   self-contained no-touch smoke test
-workspace/test_real.py     self-contained real-ceremony test (make_credential + get_assertion)
-```
-
-## Where each piece runs
-
-| Component | Lives on | Why |
-|---|---|---|
-| `laptop/agent.py` | The user's actual laptop (Mac, Linux, or Windows) | Where the YubiKey physically plugs in |
-| `pw ssh -R` tunnel | Initiated from the laptop | The laptop holds the credentials and the auth context |
-| `workspace/...` (login node / mgmt node / eventually compute node) | PW workspace, cluster mgmt node, or VDI compute node | The side that needs WebAuthn but lacks USB |
-
-## macOS setup (run once on the Mac that will hold the YubiKey)
+### On your laptop
 
 ```bash
-# 1. clone or rsync this repo onto the Mac
-# 2. install prerequisites
-cd ~/auth-relay
-bash setup-mac.sh
-
-# 3. set up a venv with python-fido2 (PEP 668 means you can't pip --user on Homebrew Python)
-python3 -m venv .venv
-source .venv/bin/activate
-pip install fido2
-
-# 4. ensure pw CLI is authenticated and the SSH key is there
-pw auth login            # if not already logged in
-ls -la ~/.ssh/pwcli      # should exist; if not, pw auth re-issues it
+git clone <this-repo> auth-relay
+cd auth-relay
+./pwrelay setup                   # one time: deps, venv, key check
+./pwrelay up gclusternoaav3       # each session: agent + tunnel, foreground
 ```
 
-## Architectural invariant: the pw tunnel is the only path
+`up` takes any pw resource: `workspace`, `gclusternoaav3`, or a full
+`pw://Matthew.Shaxted/gclusternoaav3` URI. Ctrl+C tears down cleanly.
 
-The agent binds to **`127.0.0.1` only** — it is not reachable from any
-network. The only sanctioned route from a PW session to the agent is the
-authenticated `pw ssh -R` reverse tunnel. Enforced in code (no `--host` flag),
-not by convention.
+### On the VDI (inside the ACTIVATE desktop session)
 
-## Run it (single-host code-correctness check)
-
-Both ends on the laptop, loopback. Validates code without involving any
-remote side.
+Open a terminal in your VDI desktop (XFCE menu → Terminal) and run **once**:
 
 ```bash
-source .venv/bin/activate
-python3 laptop/agent.py --port 17777 &
-python3 workspace/client.py --port 17777        # no touch required
-python3 workspace/test_real.py --port 17777     # touches the key TWICE
+git clone <this-repo> ~/auth-relay
+bash ~/auth-relay/vdi/bootstrap.sh
 ```
 
-## Run it (end-to-end through pw ssh -R)
+The script prints the extension load instructions. In short:
 
-On the workspace / cluster mgmt node, install python-fido2 once:
+1. Open `chrome://extensions` in your VDI Chrome
+2. Toggle **Developer mode** ON (top-right)
+3. Click **Load unpacked**, select `~/auth-relay/vdi/extension`
+4. The extension loads with ID `ifmfpjglkeipojipfiolefflhopdflgf` (deterministic, baked in)
+5. Click **Inspect views: service worker** on the extension card; in the
+   DevTools console you should see:
 
-```bash
-pw ssh <resource> 'python3.12 -m ensurepip --user && python3.12 -m pip install --user --upgrade fido2'
+   ```
+   [pw-relay] attach() succeeded — proxy is active
+   ```
+
+### Test it
+
+In the VDI Chrome, open **<http://localhost:8080/test.html>** and click
+**Make credential**. Your laptop YubiKey blinks; touch it; the page
+shows a real attestation.
+
+Then go to **<https://accounts.google.com>** in the same VDI Chrome and
+sign in with your security key. Touch happens on your laptop.
+
+## Architecture (one screen)
+
+```
+┌──────────────────────────────────────────┐         ┌─────────────────────────────────────────┐
+│  Your laptop                              │         │  PW resource (cluster / workspace)       │
+│                                           │         │                                          │
+│  YubiKey on USB                           │         │  VDI browser (Chrome)                    │
+│       │                                   │         │     │                                    │
+│  laptop/agent.py                          │  pw ssh │     ├ chrome.webAuthenticationProxy      │
+│  (python-fido2, CTAP2)                    │   -R    │     │   intercepts navigator.credentials│
+│       │  127.0.0.1:7777    ◀──────────────┼─────────┼─▶   │                                    │
+│       └─ pwrelay binds tunnel            7777      vdi/extension (MV3 service worker)         │
+│                                           │         │     │  WebAuthn↔CTAP2 in JS              │
+│                                           │         │     │                                    │
+│                                           │         │  vdi/nmh/relay.py (native messaging)     │
+│                                           │         │     stdio ↔ TCP                          │
+└──────────────────────────────────────────┘         └─────────────────────────────────────────┘
+                                                          (Singularity container with --net
+                                                           sharing the host loopback)
 ```
 
-Then on the laptop:
+Wire payload on the tunnel is **raw CTAPHID CBOR frames**: a one-byte
+CTAP2 command (0x01 make_credential, 0x02 get_assertion, 0x04 get_info)
+followed by CBOR-encoded arguments. Length-prefixed (4-byte big-endian).
+The agent forwards each frame straight to the USB device via
+`fido2.hid.CtapHidDevice.call(CTAPHID.CBOR, ...)`. Touch latency on the
+laptop dominates everything else; relay overhead is ~25 ms median.
 
-```bash
-source .venv/bin/activate
-python3 laptop/agent.py --port 7777 &
+## Files at a glance
 
-# push the standalone tests to the resource (one-time):
-B64=$(base64 < workspace/standalone_test.py | tr -d '\n')
-pw ssh <resource> "mkdir -p ~/noaa-yubikey-auth && echo $B64 | base64 -d > ~/noaa-yubikey-auth/standalone_test.py"
-B64=$(base64 < workspace/test_real.py | tr -d '\n')
-pw ssh <resource> "echo $B64 | base64 -d > ~/noaa-yubikey-auth/test_real.py"
-
-# open reverse tunnel + run the no-touch test:
-ssh -i ~/.ssh/pwcli \
-    -o ProxyCommand="pw ssh --proxy-command %h" \
-    -R 7777:127.0.0.1:7777 \
-    Matthew.Shaxted@<resource> \
-    'python3.12 ~/noaa-yubikey-auth/standalone_test.py'
-
-# then the real ceremony (touch the key twice when prompted):
-ssh -i ~/.ssh/pwcli \
-    -o ProxyCommand="pw ssh --proxy-command %h" \
-    -R 7777:127.0.0.1:7777 \
-    Matthew.Shaxted@<resource> \
-    'python3.12 -u ~/noaa-yubikey-auth/test_real.py'
+```
+pwrelay                  laptop CLI: setup / up / down / status
+laptop/agent.py          laptop-side TCP server, python-fido2 backend
+common/protocol.py       length-prefixed byte-frame framing
+workspace/               iter-1/2 test scripts (no browser; for routing/timing checks)
+  client.py, standalone_test.py    no-touch (authenticatorGetInfo loop)
+  test_real.py                     full ceremony (touches the key)
+vdi/
+  bootstrap.sh           VDI-side one-command setup
+  extension/             MV3 Chrome extension (webAuthenticationProxy proxy)
+  nmh/relay.py           native messaging host bridging Chrome <-> relay socket
+  test.html              self-contained local-RP test page
+  dev/cdp_probe.py       development helper for service-worker inspection
+HANDOFF.md               iteration-by-iteration log and design notes
 ```
 
-`<resource>` can be `workspace`, a cluster URI like `gclusternoaav3`, or any
-PW resource you have shell access to.
+## What's in each iteration
 
-## What iteration 1 demonstrated
+| Iter | Adds                                                                                                  | Validated against                       |
+|------|-------------------------------------------------------------------------------------------------------|-----------------------------------------|
+| 1    | length-prefixed JSON-op pipe through `pw ssh -R`, synthetic backend                                   | gpu.parallel.works → workspace          |
+| 2    | real CTAP2 over the wire, python-fido2 backend, real make_credential / get_assertion ceremonies        | Mac laptop → gclusternoaav3 mgmt node   |
+| 3    | Chrome extension + NMH so the in-VDI browser does real WebAuthn against the relay                     | Mac laptop YubiKey → accounts.google.com inside NOAA VDI Chrome |
+| 4    | Deterministic extension ID, one-command CLI on both sides, this README                                 | …                                       |
 
-- `pw ssh -R` carries arbitrary TCP cleanly between a laptop and a PW
-  workspace.
-- Median round-trip on the synthetic JSON-op relay: **~41 ms**.
-- The agent/client pattern slots into the production architecture: agent on
-  the user's laptop, relay socket terminating on a remote node, eventual
-  browser + CDP harness on a VDI compute node.
+## Troubleshooting
 
-## What iteration 2 demonstrates (this iteration)
+**`pwrelay up` says "tunnel didn't come up in 15s"**
+Check `pw auth whoami` and `~/.ssh/pwcli`. Re-run `pw auth login` if either
+is stale. The `--ProxyCommand="pw ssh --proxy-command %h"` SSH chain
+requires both.
 
-- Real CTAP2 over the wire — payload is raw `<ctap2_cmd>||<CBOR>` frames,
-  no JSON envelope, no re-encoding. The relay is byte-transparent to
-  python-fido2.
-- Real `authenticatorMakeCredential` and `authenticatorGetAssertion`
-  ceremonies complete end-to-end: laptop YubiKey blinks on demand from a
-  remote PW resource, user touches, real ECDSA signature returns.
-- Measured against the NOAA `gclusternoaav3` cluster mgmt node (which is
-  also the host that runs KasmVNC inside a Singularity container, sharing
-  the host network namespace — so the same loopback path is reachable
-  from inside the VDI):
-  - `get_info` round-trip: min 31.9, **median 35.9**, p95 60.6 ms
-    (≈12 ms USB-HID + ≈24 ms cluster-to-laptop network).
-  - `make_credential` wallclock: 4029.9 ms (≈3700 ms physical touch
-    latency dominates; network overhead 21 ms).
-  - `get_assertion` wallclock: 403.8 ms.
-- Real attestation: 1054-byte CBOR, AAGUID `c1f9a0bc1dd2404ab27f8e29047a43fd`,
-  fmt `packed`, signCount increments per ceremony.
+**Extension console says `attach() failed: webAuthenticationProxy is undefined`**
+You need Chrome (or Chromium) 115 or newer. Check `chrome://version`.
 
-## Iteration 3 (next)
+**Extension console says `attach() failed: ...permission denied / enterprise policy`**
+The `webAuthenticationProxy` API is documented as enterprise-policy-gated,
+but in practice it works for unpacked extensions in developer mode on
+Chrome stable. If you do hit the policy gate, set a per-user managed-policy
+file on the VDI host: `~/.config/google-chrome/managed/pwrelay.json`
+containing the `WebAuthenticationProxyExtensionAllowlist` policy with our
+extension ID. (No root required if your Chrome reads per-user policies.)
 
-Wire iter 2's relay to a real browser running in a NOAA ACTIVATE VDI
-desktop. Recommended approach: **CDP virtual authenticator** on a
-Chromium launched with `--remote-debugging-port`. A small Python harness
-inside the VDI calls `WebAuthn.addVirtualAuthenticator` and forwards each
-CTAP2 command into the relay socket on `127.0.0.1`. Because the KasmVNC
-container shares the host network namespace, the relay socket established
-by the user's `pw ssh -R` is already on the same loopback.
+**Test page says `SecurityError: This is an invalid domain`**
+Use the URL `http://localhost:8080/test.html` (not `http://127.0.0.1:8080`).
+WebAuthn doesn't accept IP addresses as RP IDs.
 
-UX cost: users launch Google via a "PW-managed Chromium" wrapper, not
-their normal browser icon. This is the price of doing this purely in
-userspace (no `uinput` on compute nodes).
+**Service worker idle / not picking up changes**
+After editing the extension or NMH, click the **reload icon** on the
+extension card in `chrome://extensions`. The NMH process respawns on next
+extension request automatically.
 
-The alternative (`uinput` virtual HID) is cleaner UX but needs root on
-compute nodes, which we don't have on NOAA HPC. Disqualified.
+**Google rejects the assertion**
+You need a YubiKey that has already been registered with Google (under a
+different machine is fine — the key itself holds the credential). This
+relay forwards an existing key; it doesn't create a virtual one.
+
+**The YubiKey blinks but Chrome shows a generic error**
+Inspect the service worker console for an `Invalid responseJson` message;
+it'll tell you which WebAuthn-Level-3 field Chrome rejected. We've handled
+all the ones modern accounts.google.com exercises; new RPs may surface
+new ones.
 
 ## Constraints honored
 
-- No root on either end.
-- No kernel modules, no `uinput`, no `pcscd`, no system daemons.
+- No root on either end. No kernel modules.
+- No `uinput`, no `pcscd`, no system daemons, no system services.
 - Single TCP port forwarded through the PW platform's existing auth
-  channel — no new firewall holes.
-- The agent binds loopback-only; the pw tunnel is the only sanctioned
-  network path.
+  channel; no new firewall holes; agent binds loopback only.
+- The Chrome extension is loaded by the user from $HOME (Developer Mode →
+  Load Unpacked); no store listing, no admin install.
+
+## Status and provenance
+
+This is a working POC. Validated end-to-end on:
+
+- Laptop: macOS, Python 3.14, YubiKey 5 OTP+FIDO+CCID, Chrome 148
+- VDI: NOAA `gclusternoaav3` mgmt node, KasmVNC inside Singularity
+  (--nv, no `--net`, $HOME bind-mount), Chrome 148
+
+See `HANDOFF.md` for the iteration log, design decisions, what was
+considered and discarded, and the open production-readiness questions.
+
+## CAC / smartcard?
+
+Not supported by this code. CAC uses PKCS#11 + PC/SC + TLS client cert
+auth, which is a separate protocol stack from FIDO2. The same
+architectural template (pw ssh -R + userspace agent on laptop + loopback
+endpoint on the VDI) carries over; the cargo and the VDI hook do not.
+That would be a sibling project alongside this one.
