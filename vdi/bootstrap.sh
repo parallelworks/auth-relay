@@ -112,15 +112,42 @@ done
 #   ~/.local/share/applications/     entry in the Applications menu (works on
 #                                    every modern Linux DE)
 # Same content, two locations.
+#
+# Use Chrome's bundled product logo so the launcher has a real icon
+# regardless of whether the system theme ships a google-chrome icon.
+# Chrome's RPM extract puts product_logo_*.png at /opt/google/chrome/.
+ICON_SRC=""
+for size in 256 128 64 48; do
+  cand="${REPO_ROOT}/chrome-portable/opt/google/chrome/product_logo_${size}.png"
+  [[ -f "$cand" ]] && { ICON_SRC="$cand"; break; }
+done
+if [[ -z "$ICON_SRC" && -n "${PW_CHROME_BIN:-}" ]]; then
+  # Try the dir of $PW_CHROME_BIN if relay isn't where Chrome lives.
+  cand_dir="$(dirname "$PW_CHROME_BIN")"
+  for size in 256 128 64 48; do
+    cand="${cand_dir}/product_logo_${size}.png"
+    [[ -f "$cand" ]] && { ICON_SRC="$cand"; break; }
+  done
+fi
+ICON_NAME="pw-chrome"
+ICON_DEST_DIR="${HOME}/.local/share/icons/hicolor/256x256/apps"
+mkdir -p "$ICON_DEST_DIR"
+if [[ -n "$ICON_SRC" ]]; then
+  cp -f "$ICON_SRC" "${ICON_DEST_DIR}/${ICON_NAME}.png"
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+    gtk-update-icon-cache -q "${HOME}/.local/share/icons/hicolor" 2>/dev/null || true
+  echo "[bootstrap] icon installed at ${ICON_DEST_DIR}/${ICON_NAME}.png"
+fi
+
 _DESKTOP_BODY=$(cat <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=PW Chrome (YubiKey Relay)
+Name=Chrome (w/ Relay)
 GenericName=Web Browser
 Comment=Chrome with the PW YubiKey relay extension preloaded
 Exec=${REPO_ROOT}/vdi/bin/chrome %U
-Icon=google-chrome
+Icon=${ICON_SRC:-${ICON_NAME}}
 Terminal=false
 StartupNotify=true
 Categories=Network;WebBrowser;
