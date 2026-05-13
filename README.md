@@ -1,7 +1,5 @@
 # Parallel Works Auth Relay
 
-<p align="center"><img src="thumbnail.png" width="220" alt="YubiKey"></p>
-
 Use the FIDO2 security key on your **laptop** to complete WebAuthn prompts
 from inside a Parallel Works ACTIVATE **remote desktop**. No root, no USB
 forwarding, no admin install.

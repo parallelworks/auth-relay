@@ -63,8 +63,9 @@ on:
             value: existing
       custom_relay_dir:
         type: string
-        label: Custom RELAY_DIR (only if "Use existing" above)
+        label: Custom RELAY_DIR
         default: ""
+        hidden: ${{ inputs.install_location != 'existing' }}
         tooltip: |
           Absolute path to an existing auth-relay checkout, e.g.
           /contrib/<project>/auth-relay. Leave blank to default to
