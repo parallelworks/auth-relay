@@ -105,12 +105,14 @@ for target in "$CHROME_NMH" "$CHROMIUM_NMH" "$PW_CHROME_NMH"; do
 EOF
 done
 
-# Drop a Desktop launcher icon so users can double-click to open Chrome
-# via the wrapper (which fixes stack ulimit, redirects logs, finds the
-# right binary, and auto-detects the VDI display).
-DESKTOP_FILE="${HOME}/Desktop/pw-chrome.desktop"
-if [[ -d "${HOME}/Desktop" ]] || mkdir -p "${HOME}/Desktop"; then
-  cat > "$DESKTOP_FILE" <<EOF
+# Drop a launcher in two places so the user can find it regardless of
+# which desktop environment their VDI uses:
+#   ~/Desktop/                       icon on the desktop (XFCE, GNOME w/ icons,
+#                                    MATE w/ caja-desktop, KDE)
+#   ~/.local/share/applications/     entry in the Applications menu (works on
+#                                    every modern Linux DE)
+# Same content, two locations.
+_DESKTOP_BODY=$(cat <<EOF
 [Desktop Entry]
 Type=Application
 Version=1.0
@@ -124,19 +126,47 @@ StartupNotify=true
 Categories=Network;WebBrowser;
 MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
 EOF
-  chmod +x "$DESKTOP_FILE"
-  # XFCE 4.18+ requires the executable bit AND a trust-mark via gio (or the
-  # "Allow this file to run" right-click menu). Mark it trusted preemptively
-  # if the tool exists; otherwise the user can right-click → Properties →
-  # Permissions → "Allow this file to run as a program" once.
-  if command -v gio >/dev/null 2>&1; then
-    gio set "$DESKTOP_FILE" "metadata::xfce-exe-checksum" \
-      "$(sha256sum "$DESKTOP_FILE" | cut -d' ' -f1)" 2>/dev/null || true
-    gio set "$DESKTOP_FILE" "metadata::trusted" true 2>/dev/null || true
-  fi
-  # touch the Desktop dir so XFCE / nautilus re-scans and the new
-  # icon appears without the user having to right-click → Refresh.
-  touch "${HOME}/Desktop" 2>/dev/null || true
+)
+
+DESKTOP_FILE="${HOME}/Desktop/pw-chrome.desktop"
+MENU_FILE="${HOME}/.local/share/applications/pw-chrome.desktop"
+mkdir -p "${HOME}/Desktop" "${HOME}/.local/share/applications" 2>/dev/null
+printf '%s\n' "$_DESKTOP_BODY" > "$DESKTOP_FILE"
+printf '%s\n' "$_DESKTOP_BODY" > "$MENU_FILE"
+chmod +x "$DESKTOP_FILE" "$MENU_FILE"
+
+# Trust the desktop-icon variant for file-managers that gate execution
+# behind a trust flag (XFCE 4.18+, GNOME Files).
+if command -v gio >/dev/null 2>&1; then
+  for f in "$DESKTOP_FILE" "$MENU_FILE"; do
+    gio set "$f" "metadata::xfce-exe-checksum" \
+      "$(sha256sum "$f" | cut -d' ' -f1)" 2>/dev/null || true
+    gio set "$f" "metadata::trusted" true 2>/dev/null || true
+  done
+fi
+# Update the Applications menu cache so the entry appears immediately
+# in MATE / GNOME / KDE menus without a logout.
+command -v update-desktop-database >/dev/null 2>&1 && \
+  update-desktop-database "${HOME}/.local/share/applications" >/dev/null 2>&1 || true
+# touch the Desktop dir so XFCE / caja re-scans (only useful if the
+# DE renders desktop icons; MATE's default in newer releases does NOT,
+# in which case the menu entry above is the path that works).
+touch "${HOME}/Desktop" 2>/dev/null || true
+
+# If MATE is detected and its "show desktop icons" pref is off, turn
+# it on. The user has to log out / restart the session for it to take
+# effect, but next time around their VDI desktop will actually render
+# our launcher icon. Best-effort; ignored if gsettings is absent or
+# the schema isn't installed.
+if command -v gsettings >/dev/null 2>&1 \
+    && gsettings list-schemas 2>/dev/null | grep -q '^org.mate.background$'; then
+  for disp in :0 :1 :2 :3; do
+    xauth_candidate="${HOME}/.vnc/xauth-${disp#:}"
+    if [[ -f "$xauth_candidate" ]]; then
+      DISPLAY="$disp" XAUTHORITY="$xauth_candidate" \
+        gsettings set org.mate.background show-desktop-icons true 2>/dev/null || true
+    fi
+  done
 fi
 
 # Background a local HTTP server for the test page (Singularity netns share
