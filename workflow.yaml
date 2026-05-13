@@ -270,3 +270,22 @@ jobs:
           name: ${{ sessions.testpage }}
           status: "running"
           target: ${{ inputs.resource.id }}
+
+      - name: Hold the workflow open so the ACTIVATE session stays registered
+        # ACTIVATE keeps the proxied test-page session live for as long
+        # as the workflow that registered it is running. Block here so
+        # the user can use the test page (and the relay) for the full
+        # length of their VDI session. The block exits naturally when:
+        #   - the user clicks "Stop session" in ACTIVATE (SIGTERM)
+        #   - the http.server actually dies (e.g., node reboot)
+        # The setsid'd http.server from bootstrap.sh outlives this
+        # loop's parent (the workflow runner), so the loop reliably
+        # detects "server still up" until the user stops the workflow.
+        run: |
+          set -e
+          PORT="${{ inputs.test_page_port }}"
+          echo "[keep-alive] holding session — workflow runs until you click Stop"
+          while ss -tlnp 2>/dev/null | grep -q ":${PORT} " ; do
+            sleep 30
+          done
+          echo "[keep-alive] test-page server is no longer listening on :${PORT}; exiting"
