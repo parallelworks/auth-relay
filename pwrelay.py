@@ -517,9 +517,14 @@ def cmd_up(args: argparse.Namespace) -> None:
         say(f"starting CAC agent on 127.0.0.1:{cac_port}")
         _spawn_cac_agent(cac_port)
         if not _wait_for_cac_agent_up():
-            err(f"CAC agent failed to come up; tail {LOG_CAC_AGENT}")
-            try: sys.stderr.write(LOG_CAC_AGENT.read_text()[-2000:])
-            except Exception: pass
+            err("CAC agent failed to start. Output:")
+            try:
+                sys.stderr.write("\n")
+                sys.stderr.write(LOG_CAC_AGENT.read_text()[-4000:])
+                sys.stderr.write("\n")
+            except Exception:
+                pass
+            err(f"(full log: {LOG_CAC_AGENT})")
             cmd_down(args)
             sys.exit(1)
         ok(f"CAC agent listening on 127.0.0.1:{cac_port}")
