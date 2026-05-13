@@ -347,6 +347,19 @@ def main() -> int:
         "--disable-default-apps",
         "--disable-search-engine-choice-screen",
         "--password-store=basic",
+        # HPC-node hardening — must mirror vdi/bin/chrome since the
+        # install step here launches Chrome directly (not via the
+        # wrapper). Without these, Chrome on Gaea/Ursa/Google-cluster
+        # crash-loops the GPU process trying to init Vulkan against
+        # SwiftShader (no real GPU), and the on-device-model service
+        # cascades through that. Symptom: "Starting Chrome" hangs then
+        # the proc crashes before the CDP handshake completes.
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer",
+        # Cap renderer forks — Ursa's default ulimit -u is 1024 and
+        # Chrome easily blows past that when left uncapped.
+        "--renderer-process-limit=4",
         # Pipe-based CDP (stdio rather than WebSocket). The Extensions
         # domain is only available over this transport. Combined with
         # --enable-unsafe-extension-debugging to unlock the method.
@@ -356,15 +369,30 @@ def main() -> int:
         # after install-extension.py completes.
         "chrome://extensions",
     ]
-    # ulimit -Ss is shell-level; set RLIMIT_STACK in this process before exec.
+    # Raise rlimits the same way vdi/bin/chrome does. On Gaea the default
+    # stack is 1 GiB which blows /proc/sys/vm/max_map_count under Chrome's
+    # per-thread mapping pattern; on Ursa the default -u is 1024 procs
+    # and -n is 6400 fds — Chrome saturates both.
     try:
-        import resource
-        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
-        target = 8 * 1024 * 1024  # 8 MiB
-        if soft > target:
-            resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
+        import resource as _rlim
+        # Stack: clamp to 8 MiB if the soft limit is higher.
+        soft_s, hard_s = _rlim.getrlimit(_rlim.RLIMIT_STACK)
+        stack_target = 8 * 1024 * 1024  # 8 MiB
+        if soft_s > stack_target:
+            _rlim.setrlimit(_rlim.RLIMIT_STACK, (stack_target, hard_s))
+        # Max procs: raise soft to hard.
+        try:
+            soft_u, hard_u = _rlim.getrlimit(_rlim.RLIMIT_NPROC)
+            if soft_u < hard_u:
+                _rlim.setrlimit(_rlim.RLIMIT_NPROC, (hard_u, hard_u))
+        except (AttributeError, ValueError, OSError) as e:
+            print(f"[install] could not raise NPROC: {e}", file=sys.stderr)
+        # Open files: raise soft to hard.
+        soft_n, hard_n = _rlim.getrlimit(_rlim.RLIMIT_NOFILE)
+        if soft_n < hard_n:
+            _rlim.setrlimit(_rlim.RLIMIT_NOFILE, (hard_n, hard_n))
     except Exception as e:
-        print(f"[install] could not clamp stack rlimit: {e}", file=sys.stderr)
+        print(f"[install] could not clamp/raise rlimits: {e}", file=sys.stderr)
     # Chrome's pipe-based CDP expects fd 3 = stdin, fd 4 = stdout, with
     # CLOEXEC clear so they survive exec. We tried doing this in a
     # subprocess preexec_fn dup2 — Chrome kept reporting "Remote
