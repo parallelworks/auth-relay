@@ -46,11 +46,19 @@ EOF
   exit 1
 }
 
-# We DO NOT set --user-data-dir. Earlier deployment caught that Chrome
-# (148+) looks for native-messaging-host manifests under
-# <user-data-dir>/NativeMessagingHosts/, NOT at the standard
-# ~/.config/google-chrome/NativeMessagingHosts/ path that bootstrap.sh
-# writes to. Forcing the default profile keeps the lookup wired up.
+# We USE a dedicated user-data-dir for the relay. Chrome 148+ has two
+# constraints that together force this:
+#   1. NMH manifests are looked up under <user-data-dir>/NativeMessagingHosts/
+#      when --user-data-dir is explicitly set.
+#   2. --remote-debugging-port is silently disabled if --user-data-dir
+#      is NOT set ("DevTools remote debugging requires a non-default
+#      data directory" appears in the log). install-extension.py's
+#      CDP-driven Extensions.loadUnpacked needs the debug port, so we
+#      have to pass --user-data-dir.
+# bootstrap.sh writes the NMH manifest into this dir's
+# NativeMessagingHosts/ so #1 resolves correctly.
+PW_CHROME_USER_DATA_DIR="${PW_CHROME_USER_DATA_DIR:-$HOME/.config/google-chrome-pwrelay}"
+mkdir -p "$PW_CHROME_USER_DATA_DIR" 2>/dev/null || true
 #
 # Redirect Chrome's stderr/stdout to a log file. Chrome dumps a *lot* of
 # debug info to stderr by default; left attached to a terminal that
@@ -98,6 +106,7 @@ ulimit -Ss 8192 2>/dev/null || true
 # service request pops a modal that steals focus and silently blocks
 # install-extension.py's CDP Extensions.loadUnpacked.
 exec "$CHROME" \
+    --user-data-dir="$PW_CHROME_USER_DATA_DIR" \
     --no-first-run \
     --no-default-browser-check \
     --disable-default-apps \

@@ -257,8 +257,16 @@ def main() -> int:
     ap.add_argument("--ext-dir", default=str(repo_root / "vdi" / "extension"))
     ap.add_argument(
         "--profile",
-        default=str(Path.home() / ".config" / "google-chrome"),
-        help="Chrome profile dir to seed and use. Default is the standard user profile.",
+        default=os.environ.get(
+            "PW_CHROME_USER_DATA_DIR",
+            str(Path.home() / ".config" / "google-chrome-pwrelay"),
+        ),
+        help=(
+            "Chrome --user-data-dir to seed and use. Default is the "
+            "auth-relay-dedicated profile (~/.config/google-chrome-pwrelay). "
+            "Chrome 148+ requires a non-default user-data-dir to enable the "
+            "remote debugging port we use for Extensions.loadUnpacked."
+        ),
     )
     ap.add_argument("--port", type=int, default=0, help="0 = pick a free one")
     ap.add_argument(
@@ -311,6 +319,12 @@ def main() -> int:
     log = open(log_path, "ab")
     cmd = [
         chrome_bin,
+        # Chrome 148+ disables --remote-debugging-port unless
+        # --user-data-dir is also explicitly set ("DevTools remote
+        # debugging requires a non-default data directory" appears in
+        # the log otherwise). bootstrap.sh seeds the NMH manifest into
+        # this same dir's NativeMessagingHosts/ so Chrome finds it.
+        f"--user-data-dir={profile}",
         # Suppress first-run UI gates that block CDP install on a fresh
         # profile: the default-browser prompt, the welcome screen,
         # (since Chrome ~122) the search-engine-choice modal, and the
