@@ -47,17 +47,42 @@ err() { printf '%s\n' "[pcsc-bootstrap error] $*" >&2; }
 say() { printf '%s\n' "[pcsc-bootstrap] $*"; }
 
 # ---- prereq checks --------------------------------------------------------
+#
+# We need TWO things on the VDI side:
+#   1. modutil + certutil for NSS registration (libnss3-tools / nss-tools).
+#   2. A stdio<->TCP bridge tool that p11-kit's `remote:` field can invoke.
+#      socat is the typical pick; on HPC images without it (NOAA Ursa
+#      etc.) we fall back to ncat or nc — both can do the bridge with the
+#      same effective semantics.
 
-for cmd in socat modutil certutil; do
+for cmd in modutil certutil; do
   command -v "$cmd" >/dev/null 2>&1 || {
-    err "$cmd not on PATH."
-    case "$cmd" in
-      socat)            err "  install: sudo apt install socat   (or dnf/yum)" ;;
-      modutil|certutil) err "  install: sudo apt install libnss3-tools   (or nss-tools on RHEL)" ;;
-    esac
+    err "$cmd not on PATH (install libnss3-tools / nss-tools)."
     exit 1
   }
 done
+
+BRIDGE_CMD=""
+if command -v socat >/dev/null 2>&1; then
+  # `socat - TCP:host:port` — stdin/stdout bridged to a TCP socket.
+  BRIDGE_CMD="socat - TCP:127.0.0.1:${PORT}"
+elif command -v ncat >/dev/null 2>&1; then
+  # ncat is Nmap's improved netcat. Connect mode by default, full-duplex
+  # over stdio. `--no-shutdown` keeps stdin open after the remote half
+  # closes (p11-kit may continue writing after a server-side EOF).
+  BRIDGE_CMD="ncat --no-shutdown 127.0.0.1 ${PORT}"
+elif command -v nc >/dev/null 2>&1; then
+  # OpenBSD / GNU netcat: -N closes the network side when stdin EOFs;
+  # we don't want that, so we omit it. Plain `nc <host> <port>` is the
+  # most-portable form across nc variants.
+  BRIDGE_CMD="nc 127.0.0.1 ${PORT}"
+else
+  err "no stdio<->TCP bridge tool found. Need ONE of: socat / ncat / nc"
+  err "  Debian/Ubuntu: sudo apt install ncat   (or socat / netcat-openbsd)"
+  err "  RHEL/Rocky:    sudo dnf install ncat   (or socat)"
+  exit 1
+fi
+say "using bridge: $BRIDGE_CMD"
 
 # ---- find p11-kit-client.so ----------------------------------------------
 
@@ -89,7 +114,7 @@ cat > ~/.config/p11-kit/modules/${MOD_NAME}.module <<EOF
 # Bridges the in-VDI PKCS#11 stack to the laptop's CAC via the
 # auth-relay pw ssh -R tunnel (TCP on 127.0.0.1:${PORT}).
 module: ${P11_KIT_CLIENT}
-remote: |socat - TCP:127.0.0.1:${PORT}
+remote: |${BRIDGE_CMD}
 EOF
 chmod 600 ~/.config/p11-kit/modules/${MOD_NAME}.module
 say "wrote module config: ~/.config/p11-kit/modules/${MOD_NAME}.module"
