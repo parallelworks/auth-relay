@@ -58,6 +58,16 @@ case "$(uname -s)" in
   *) echo "unsupported OS: $(uname -s)" >&2; exit 1 ;;
 esac
 
+# Dedicated user-data-dir for the relay's Chrome. We need this because
+# Chrome 148+ disables --remote-debugging-port unless --user-data-dir
+# is also set (the install-extension.py CDP install depends on the
+# debug port), AND when --user-data-dir is set Chrome only looks for
+# NMH manifests under <user-data-dir>/NativeMessagingHosts/. So this
+# dir is where the manifest, the seeded Preferences, and the seeded
+# Bookmarks all go.
+PW_CHROME_USER_DATA_DIR="${PW_CHROME_USER_DATA_DIR:-$HOME/.config/google-chrome-pwrelay}"
+PW_CHROME_NMH="${PW_CHROME_USER_DATA_DIR}/NativeMessagingHosts"
+
 # Pick a python3 (NMH needs 3.7+ for `from __future__ import annotations`).
 PYTHON_BIN=""
 for cand in python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3; do
@@ -82,8 +92,8 @@ exec ${PYTHON_BIN} ${NMH_DIR}/relay.py "\$@"
 EOF
 chmod +x "${NMH_DIR}/relay-wrapper.sh"
 
-mkdir -p "$CHROME_NMH" "$CHROMIUM_NMH"
-for target in "$CHROME_NMH" "$CHROMIUM_NMH"; do
+mkdir -p "$CHROME_NMH" "$CHROMIUM_NMH" "$PW_CHROME_NMH"
+for target in "$CHROME_NMH" "$CHROMIUM_NMH" "$PW_CHROME_NMH"; do
   cat > "${target}/${NMH_NAME}.json" <<EOF
 {
   "name": "${NMH_NAME}",
@@ -146,8 +156,9 @@ fi
 # Pre-seed Chrome's developer_mode pref so the user does not have to click the
 # toggle in chrome://extensions, and turn on the bookmarks bar so the seeded
 # bookmarks (next block) are visible immediately. Only writes the keys we care
-# about; never destroys other prefs.
-PREF_DIR="${HOME}/.config/google-chrome/Default"
+# about; never destroys other prefs. Seeded into the dedicated user-data-dir
+# Chrome will actually use (see comment near PW_CHROME_USER_DATA_DIR above).
+PREF_DIR="${PW_CHROME_USER_DATA_DIR}/Default"
 PREF_FILE="${PREF_DIR}/Preferences"
 mkdir -p "$PREF_DIR"
 "$PYTHON_BIN" - "$PREF_FILE" <<'PYSEED'
