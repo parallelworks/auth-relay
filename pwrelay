@@ -91,10 +91,14 @@ stop_pid() {
   if is_running "$pid_file"; then
     local pid; pid=$(cat "$pid_file")
     say "stopping $name (pid $pid)"
+    # Kill children first so an ssh child of the supervisor loop doesn't
+    # outlive the loop and keep holding the remote port for the next run.
+    local kids; kids=$(pgrep -P "$pid" 2>/dev/null || true)
     kill "$pid" 2>/dev/null || true
-    # Give it 2s to exit, then SIGKILL.
+    [[ -n "$kids" ]] && kill $kids 2>/dev/null || true
     for _ in 1 2 3 4; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
     kill -9 "$pid" 2>/dev/null || true
+    [[ -n "$kids" ]] && kill -9 $kids 2>/dev/null || true
   fi
   rm -f "$pid_file"
 }
@@ -141,17 +145,33 @@ cmd_up() {
   fi
   ok "agent listening on 127.0.0.1:${PORT}"
 
-  # Tunnel.
+  # Tunnel — wrapped in a supervisor loop so the connection respawns if the
+  # cluster drops the session (NOAA Gaea has been seen to idle-timeout after
+  # roughly an hour even with ServerAliveInterval set). The supervisor itself
+  # is what we put in PID_TUNNEL; killing it exits the loop cleanly.
   local rs_user; rs_user=$(resource_user)
-  say "opening reverse tunnel via pw ssh to $resource ($rs_user@$resource)"
-  ssh -i "$HOME/.ssh/pwcli" \
-      -o ProxyCommand="pw ssh --proxy-command %h" \
-      -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
-      -R "${PORT}:127.0.0.1:${PORT}" \
-      "${rs_user}@${resource}" \
-      'echo "[remote] tunnel-up on $(hostname); pid=$$"; exec sleep 86400' \
-      >"$LOG_TUNNEL" 2>&1 &
+  say "opening reverse tunnel via pw ssh to $resource ($rs_user@$resource) [auto-reconnect]"
+  : >"$LOG_TUNNEL"
+  (
+    while true; do
+      ssh -i "$HOME/.ssh/pwcli" \
+          -o ProxyCommand="pw ssh --proxy-command %h" \
+          -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+          -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+          -o ExitOnForwardFailure=yes \
+          -R "${PORT}:127.0.0.1:${PORT}" \
+          "${rs_user}@${resource}" \
+          'echo "[remote] tunnel-up on $(hostname); pid=$$"; exec sleep 86400'
+      rc=$?
+      # Auth or port-conflict failures are terminal — don't busy-loop.
+      if grep -qE "Permission denied|remote port forwarding failed" "$LOG_TUNNEL" 2>/dev/null; then
+        echo "[supervisor] terminal failure (rc=$rc); not retrying" >>"$LOG_TUNNEL"
+        exit "$rc"
+      fi
+      echo "[supervisor] ssh exited rc=$rc — reconnecting in 3s" >>"$LOG_TUNNEL"
+      sleep 3
+    done
+  ) >>"$LOG_TUNNEL" 2>&1 &
   echo $! > "$PID_TUNNEL"
 
   # Wait for the tunnel-up line.

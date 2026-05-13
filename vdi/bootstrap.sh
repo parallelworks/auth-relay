@@ -22,10 +22,29 @@ EXT_ID_DEFAULT="ifmfpjglkeipojipfiolefflhopdflgf"
 EXT_ID="${PW_EXT_ID:-$EXT_ID_DEFAULT}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$HERE/.." && pwd)"
 EXT_DIR="${HERE}/extension"
 NMH_DIR="${HERE}/nmh"
 NMH_NAME="com.parallelworks.yubikey_relay"
 HTTP_PORT="${PW_HTTP_PORT:-8080}"
+
+# Locate Chrome. Same priority list as vdi/bin/chrome.
+find_chrome() {
+  if [[ -n "${PW_CHROME_BIN:-}" && -x "${PW_CHROME_BIN}" ]]; then
+    printf '%s' "$PW_CHROME_BIN"; return 0
+  fi
+  local cands=(
+    "$REPO_ROOT/chrome-portable/opt/google/chrome/google-chrome"
+    "/usr/bin/google-chrome"
+    "/usr/bin/google-chrome-stable"
+  )
+  for c in "${cands[@]}"; do [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }; done
+  for c in chromium chromium-browser; do
+    command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }
+  done
+  return 1
+}
+CHROME_BIN_FOUND="$(find_chrome || true)"
 
 case "$(uname -s)" in
   Linux)
@@ -80,6 +99,12 @@ if ! ss -tlnp 2>/dev/null | grep -q ":${HTTP_PORT}\b"; then
   sleep 0.5
 fi
 
+if [[ -n "$CHROME_BIN_FOUND" ]]; then
+  CHROME_STATUS="${CHROME_BIN_FOUND}"
+else
+  CHROME_STATUS="NOT FOUND — run \`bash ${HERE}/install-chrome.sh [<install-prefix>]\` or set PW_CHROME_BIN"
+fi
+
 cat <<EOF
 
 ==============================================================================
@@ -91,16 +116,21 @@ NMH manifest    : ${CHROME_NMH}/${NMH_NAME}.json
                   ${CHROMIUM_NMH}/${NMH_NAME}.json
 Test page       : http://localhost:${HTTP_PORT}/test.html
 Extension path  : ${EXT_DIR}
+Chrome binary   : ${CHROME_STATUS}
 
 Steps in your VDI Chrome (one time per browser profile):
 
-  1. Open chrome://extensions
-  2. Toggle "Developer mode" ON  (top-right)
-  3. Click "Load unpacked" and select:
+  1. Launch Chrome via the wrapper (no --user-data-dir flag; that breaks
+     native-messaging-host lookup on Chrome 148+):
+        ${REPO_ROOT}/vdi/bin/chrome &
+
+  2. Open chrome://extensions
+  3. Toggle "Developer mode" ON  (top-right)
+  4. Click "Load unpacked" and select:
         ${EXT_DIR}
      → it should appear with ID ${EXT_ID}
 
-  4. Click "Inspect views: service worker" on the extension card; in the
+  5. Click "Inspect views: service worker" on the extension card; in the
      DevTools console you should see:
         [pw-relay] attach() succeeded — proxy is active
 

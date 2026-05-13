@@ -28,21 +28,51 @@ Open a terminal in your VDI desktop (XFCE menu → Terminal) and run **once**:
 
 ```bash
 git clone <this-repo> ~/auth-relay
+bash ~/auth-relay/vdi/install-chrome.sh   # portable Chrome under ~/auth-relay/chrome-portable
 bash ~/auth-relay/vdi/bootstrap.sh
 ```
 
-The script prints the extension load instructions. In short:
+The bootstrap script prints the extension load instructions. In short:
 
-1. Open `chrome://extensions` in your VDI Chrome
-2. Toggle **Developer mode** ON (top-right)
-3. Click **Load unpacked**, select `~/auth-relay/vdi/extension`
-4. The extension loads with ID `ifmfpjglkeipojipfiolefflhopdflgf` (deterministic, baked in)
-5. Click **Inspect views: service worker** on the extension card; in the
+1. Launch Chrome via the wrapper (do NOT pass `--user-data-dir` — Chrome
+   148+ won't find the NMH manifest if you do):
+   ```bash
+   ~/auth-relay/vdi/bin/chrome &
+   ```
+2. Open `chrome://extensions`
+3. Toggle **Developer mode** ON (top-right)
+4. Click **Load unpacked**, select `~/auth-relay/vdi/extension`
+5. The extension loads with ID `ifmfpjglkeipojipfiolefflhopdflgf` (deterministic, baked in)
+6. Click **Inspect views: service worker** on the extension card; in the
    DevTools console you should see:
 
    ```
    [pw-relay] attach() succeeded — proxy is active
    ```
+
+#### NOAA on-prem (Ursa, Gaea, Hera, …): install Chrome once into `/contrib`
+
+On NOAA HPC, `$HOME` is small (10 GB on Ursa) and Chrome is ~340 MB. Avoid
+the quota hit by installing Chrome **once, by an admin, into your project's
+shared contrib filesystem**, then have users point `PW_CHROME_BIN` at it:
+
+```bash
+# Admin (once per cluster). Choose the contrib path your project uses.
+git clone <this-repo> /contrib/<project>/auth-relay
+bash /contrib/<project>/auth-relay/vdi/install-chrome.sh /contrib/<project>/auth-relay
+```
+
+```bash
+# Users, in their shell rc (e.g. ~/.bashrc on the cluster login node):
+export PW_CHROME_BIN=/contrib/<project>/auth-relay/chrome-portable/opt/google/chrome/google-chrome
+```
+
+`bootstrap.sh`, `vdi/bin/chrome`, and any future scripts honor that env var.
+
+Also confirmed in testing: Chrome 148+ on NOAA RHEL/SLES (glibc ≥ 2.34) runs
+cleanly from a portable extraction. Firefox is the only system browser on the
+login nodes we've tested (Ursa `ufe02`, Gaea `gaea54`), so the portable Chrome
+is required.
 
 ### Test it
 
@@ -84,14 +114,16 @@ laptop dominates everything else; relay overhead is ~25 ms median.
 ## Files at a glance
 
 ```
-pwrelay                  laptop CLI: setup / up / down / status
+pwrelay                  laptop CLI: setup / up / down / status (auto-reconnects the tunnel)
 laptop/agent.py          laptop-side TCP server, python-fido2 backend
 common/protocol.py       length-prefixed byte-frame framing
 workspace/               iter-1/2 test scripts (no browser; for routing/timing checks)
   client.py, standalone_test.py    no-touch (authenticatorGetInfo loop)
   test_real.py                     full ceremony (touches the key)
 vdi/
-  bootstrap.sh           VDI-side one-command setup
+  bootstrap.sh           VDI-side one-command setup (NMH manifest, http.server, etc.)
+  install-chrome.sh      portable Chrome installer; pass a target dir to use /contrib
+  bin/chrome             Chrome wrapper; honors $PW_CHROME_BIN, no --user-data-dir
   extension/             MV3 Chrome extension (webAuthenticationProxy proxy)
   nmh/relay.py           native messaging host bridging Chrome <-> relay socket
   test.html              self-contained local-RP test page
@@ -106,7 +138,8 @@ HANDOFF.md               iteration-by-iteration log and design notes
 | 1    | length-prefixed JSON-op pipe through `pw ssh -R`, synthetic backend                                   | gpu.parallel.works → workspace          |
 | 2    | real CTAP2 over the wire, python-fido2 backend, real make_credential / get_assertion ceremonies        | Mac laptop → gclusternoaav3 mgmt node   |
 | 3    | Chrome extension + NMH so the in-VDI browser does real WebAuthn against the relay                     | Mac laptop YubiKey → accounts.google.com inside NOAA VDI Chrome |
-| 4    | Deterministic extension ID, one-command CLI on both sides, this README                                 | …                                       |
+| 4    | Deterministic extension ID, one-command CLI on both sides, this README                                 | gclusternoaav3 mgmt node                |
+| 5    | On-prem packaging: portable Chrome installer + wrapper, `pw ssh -R` auto-reconnect, contrib install pattern | NOAA Ursa `ufe02`, Gaea-C5 `gaea54`     |
 
 ## Troubleshooting
 
@@ -114,6 +147,13 @@ HANDOFF.md               iteration-by-iteration log and design notes
 Check `pw auth whoami` and `~/.ssh/pwcli`. Re-run `pw auth login` if either
 is stale. The `--ProxyCommand="pw ssh --proxy-command %h"` SSH chain
 requires both.
+
+**Tunnel disconnects mid-session (NOAA Gaea / Hera idle drops)**
+`pwrelay` runs the `ssh -R` inside a supervisor loop that auto-reconnects
+in 3 seconds on idle drops. You'll see `[supervisor] ssh exited rc=N —
+reconnecting in 3s` in `/tmp/pwrelay-tunnel.log`. If the supervisor itself
+ever exits (auth failure, or remote port held), that's terminal; check
+the log.
 
 **`pwrelay up` says "remote port 7777 is already bound by another process"**
 A prior pwrelay session left an `ssh -R ... sleep 86400` running on the
