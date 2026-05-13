@@ -32,23 +32,37 @@ bash ~/auth-relay/vdi/install-chrome.sh   # portable Chrome under ~/auth-relay/c
 bash ~/auth-relay/vdi/bootstrap.sh
 ```
 
-The bootstrap script prints the extension load instructions. In short:
+The bootstrap script pre-seeds Chrome's `developer_mode` pref and prints the
+extension load instructions. To finish:
+
+**Option A — auto-install** (recommended, zero UI clicks):
+
+```bash
+# Chrome must NOT already be running.
+python3 ~/auth-relay/vdi/install-extension.py
+```
+
+The script launches Chrome with a one-shot debug port, calls
+`Extensions.loadUnpacked` over CDP, then leaves Chrome running with the
+extension active.
+
+**Option B — manual** (if you want to inspect or A is blocked):
 
 1. Launch Chrome via the wrapper (do NOT pass `--user-data-dir` — Chrome
    148+ won't find the NMH manifest if you do):
    ```bash
    ~/auth-relay/vdi/bin/chrome &
    ```
-2. Open `chrome://extensions`
-3. Toggle **Developer mode** ON (top-right)
-4. Click **Load unpacked**, select `~/auth-relay/vdi/extension`
-5. The extension loads with ID `ifmfpjglkeipojipfiolefflhopdflgf` (deterministic, baked in)
-6. Click **Inspect views: service worker** on the extension card; in the
-   DevTools console you should see:
+2. Open `chrome://extensions` (developer mode is already on — we seeded it)
+3. Click **Load unpacked**, select `~/auth-relay/vdi/extension`
+4. The extension loads with ID `ifmfpjglkeipojipfiolefflhopdflgf` (deterministic, baked in)
 
-   ```
-   [pw-relay] attach() succeeded — proxy is active
-   ```
+Either way, click **Inspect views: service worker** on the extension card;
+the DevTools console should print:
+
+```
+[pw-relay] attach() succeeded — proxy is active
+```
 
 #### NOAA on-prem (Ursa, Gaea, Hera, …): install Chrome once into `/contrib`
 

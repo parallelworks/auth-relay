@@ -105,6 +105,25 @@ else
   CHROME_STATUS="NOT FOUND — run \`bash ${HERE}/install-chrome.sh [<install-prefix>]\` or set PW_CHROME_BIN"
 fi
 
+# Pre-seed Chrome's developer_mode pref so the user does not have to click the
+# toggle in chrome://extensions. Only writes if the file doesn't already exist
+# or doesn't have the key set; never destroys other prefs.
+PREF_DIR="${HOME}/.config/google-chrome/Default"
+PREF_FILE="${PREF_DIR}/Preferences"
+mkdir -p "$PREF_DIR"
+"$PYTHON_BIN" - "$PREF_FILE" <<'PYSEED'
+import json, os, sys
+path = sys.argv[1]
+try:
+    prefs = json.load(open(path)) if os.path.exists(path) else {}
+except Exception:
+    prefs = {}
+prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
+with open(path, "w") as f:
+    json.dump(prefs, f, indent=2)
+print(f"[bootstrap] developer_mode=true seeded in {path}")
+PYSEED
+
 cat <<EOF
 
 ==============================================================================
@@ -118,21 +137,29 @@ Test page       : http://localhost:${HTTP_PORT}/test.html
 Extension path  : ${EXT_DIR}
 Chrome binary   : ${CHROME_STATUS}
 
-Steps in your VDI Chrome (one time per browser profile):
+Two ways to load the extension into Chrome:
 
-  1. Launch Chrome via the wrapper (no --user-data-dir flag; that breaks
-     native-messaging-host lookup on Chrome 148+):
-        ${REPO_ROOT}/vdi/bin/chrome &
+  -- A. Auto-install (recommended; one command, no UI clicks): --
 
-  2. Open chrome://extensions
-  3. Toggle "Developer mode" ON  (top-right)
-  4. Click "Load unpacked" and select:
-        ${EXT_DIR}
-     → it should appear with ID ${EXT_ID}
+       Make sure Chrome is NOT already running, then:
+           python3 ${HERE}/install-extension.py
 
-  5. Click "Inspect views: service worker" on the extension card; in the
-     DevTools console you should see:
-        [pw-relay] attach() succeeded — proxy is active
+       It launches Chrome with a debug port, asks it to load the unpacked
+       extension via CDP, then leaves Chrome running for you. Developer mode
+       is already on (we just seeded it).
+
+  -- B. Manual (if A is blocked or you want to inspect): --
+
+       Launch Chrome via the wrapper (NEVER pass --user-data-dir — Chrome 148+
+       won't find the NMH manifest if you do):
+           ${REPO_ROOT}/vdi/bin/chrome &
+       Open chrome://extensions, click "Load unpacked", select:
+           ${EXT_DIR}
+       Verify the assigned ID is ${EXT_ID}.
+
+Either way, click "Inspect views: service worker" on the extension card; the
+DevTools console should print:
+    [pw-relay] attach() succeeded — proxy is active
 
 After the laptop side is up (run \`./pwrelay up <pw-resource>\` on your
 laptop), open http://localhost:${HTTP_PORT}/test.html and click
