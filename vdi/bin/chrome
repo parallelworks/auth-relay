@@ -58,6 +58,26 @@ EOF
 # is at /tmp/pw-chrome.log if you need to inspect it.
 LOG="${PW_CHROME_LOG:-/tmp/pw-chrome-$(id -un).log}"
 
+# If DISPLAY isn't set (e.g., we were invoked from a pw ssh shell with no
+# X forwarding), discover the user's running VNC server's display + auth
+# file. Lets `pw ssh resource '~/auth-relay/vdi/bin/chrome &'` Just Work
+# from a laptop terminal — Chrome pops into the VDI desktop the user
+# already has open.
+if [[ -z "${DISPLAY:-}" ]]; then
+  vnc_argv=$(ps -u "$(whoami)" -o args= 2>/dev/null \
+              | grep -E '/(Xvnc|Xkasmvnc|Xtigervnc|Xvfb)( |$)' \
+              | head -1)
+  if [[ -n "$vnc_argv" ]]; then
+    disp=$(printf ' %s ' "$vnc_argv" | grep -oE ' :[0-9]+ ' | head -1 | tr -d ' ')
+    xauth=$(printf '%s' "$vnc_argv" | sed -nE 's/.*-auth +([^ ]+).*/\1/p' | head -1)
+    if [[ -n "$disp" ]]; then
+      export DISPLAY="$disp"
+      [[ -n "$xauth" ]] && export XAUTHORITY="$xauth"
+      echo "[chrome] auto-detected VDI: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-(none)}" >&2
+    fi
+  fi
+fi
+
 # NOAA HPC login nodes (Gaea, Hera, ...) ship with ulimit -s = 1 GiB
 # (1048576 KiB), which Chrome inherits. Every pthread_create reserves
 # a stack mapping of that size; Chrome opens hundreds of threads and

@@ -34,6 +34,22 @@ key on your desk; the assertion comes back; the page authenticates.
 
 ---
 
+## Before you start
+
+You need these on your **laptop** (one-time):
+
+1. **`pw` CLI installed.** See <https://parallelworks.com/docs/cli> or
+   `brew install parallelworks/pw/pw` on macOS.
+2. **`pw` CLI authenticated.** Run `pw auth login` and complete the
+   browser flow. Verify with `pw auth whoami`. This also writes
+   `~/.ssh/pwcli` which the relay's `ssh -R` uses.
+3. **Python 3.10+** on PATH (Mac stock; on Linux any modern distro).
+4. **A FIDO2 security key** (YubiKey 5, anything CTAP2-capable)
+   plugged into a USB port. The agent verifies it at `./pwrelay setup`.
+
+On the **VDI** side: a desktop session via PW ACTIVATE. Nothing else;
+the relay installs its own Chrome and Python deps under your `$HOME`.
+
 ## Quickstart
 
 ### On your **laptop** (Mac, Linux, or WSL on Windows)
@@ -52,38 +68,91 @@ the agent and the `pw ssh -R` tunnel; Ctrl+C tears it all down cleanly.
 
 ### Inside the **VDI desktop** (one time per session)
 
-Open a terminal in the desktop and:
+Open a terminal in the desktop. First, pick where to install the relay:
 
 ```bash
-git clone https://github.com/parallelworks/auth-relay ~/auth-relay
-bash ~/auth-relay/vdi/install-chrome.sh           # ~5 min, one time, no root
-bash ~/auth-relay/vdi/bootstrap.sh                # one time per VDI session
-python3 ~/auth-relay/vdi/install-extension.py     # auto-loads the extension into Chrome
+# Where to put the relay + portable Chrome (~340 MB). Pick one:
+#
+#   $HOME/auth-relay              if your $HOME has ≥500 MB free
+#   /tmp/$USER/auth-relay         if $HOME is tight; /tmp must be on the
+#                                  SAME node as your VDI desktop (true on
+#                                  most single-login-node clusters). Cleared
+#                                  on reboot — reinstall once per uptime.
+#   /contrib/<proj>/auth-relay    admin-installed once into shared project
+#                                  storage; all users in <proj> share it.
+#                                  See "Cluster with a small $HOME quota?"
+#                                  below.
+export RELAY_DIR="$HOME/auth-relay"
+```
+
+Then:
+
+**First-time setup (each new VDI session):**
+
+```bash
+git clone https://github.com/parallelworks/auth-relay "$RELAY_DIR"
+bash "$RELAY_DIR/vdi/install-chrome.sh" "$RELAY_DIR"   # ~5 min, one time, no root
+bash "$RELAY_DIR/vdi/bootstrap.sh"                     # NMH manifest + http.server
+python3 "$RELAY_DIR/vdi/install-extension.py"          # auto-loads extension into Chrome
 ```
 
 The last command launches Chrome, loads the extension via Chrome's
 DevTools Protocol (no UI clicks), and leaves Chrome running with the
-relay wired up. Go to your SSO portal or `https://accounts.google.com`
-and sign in. Touch the security key on your laptop when prompted.
+relay wired up.
+
+**Day-two and later — just open Chrome via the wrapper:**
+
+```bash
+"$RELAY_DIR/vdi/bin/chrome" &
+```
+
+The wrapper sets up the right stack ulimit, points at the portable
+Chrome via `$PW_CHROME_BIN`, and redirects Chrome's noisy stderr to
+`/tmp/pw-chrome-<user>.log` so your terminal stays usable. The
+extension is persistently installed in your Chrome profile from the
+first-time run; you don't need `install-extension.py` again unless you
+wipe `~/.config/google-chrome/Default`.
+
+In Chrome, go to your SSO portal or `https://accounts.google.com` and
+sign in. Touch the security key on your laptop when prompted.
 
 ### Cluster with a small `$HOME` quota? Install Chrome once into a shared dir.
 
-If user homes are tight (typical on HPC), install Chrome into a shared
-project directory once instead of into every user's `$HOME`:
+If user homes are tight (typical on HPC), an admin can install the relay
+into a project's shared contrib filesystem once, then individual users
+just point at the prebuilt Chrome:
 
 ```bash
 # admin, once per cluster:
-git clone https://github.com/parallelworks/auth-relay /shared/path/auth-relay
-bash /shared/path/auth-relay/vdi/install-chrome.sh /shared/path/auth-relay
+export RELAY_DIR=/contrib/<your-project>/auth-relay
+git clone https://github.com/parallelworks/auth-relay "$RELAY_DIR"
+bash "$RELAY_DIR/vdi/install-chrome.sh" "$RELAY_DIR"
 ```
 
 ```bash
 # users, in their shell rc on the cluster:
-echo 'export PW_CHROME_BIN=/shared/path/auth-relay/chrome-portable/opt/google/chrome/google-chrome' >> ~/.bashrc
+echo 'export PW_CHROME_BIN=/contrib/<your-project>/auth-relay/chrome-portable/opt/google/chrome/google-chrome' >> ~/.bashrc
 ```
 
 `bootstrap.sh`, the chrome wrapper, and `install-extension.py` all honor
 that env var.
+
+### Quick alternative: install Chrome in `/tmp`
+
+If you can't write to `/contrib` and `$HOME` is tight, `/tmp` on the
+login node is usually fine — it's local disk on most clusters and has
+hundreds of GB free. Caveats: it's per-node (won't help on clusters
+that move you between login nodes mid-session), and it's cleared on
+node reboot.
+
+```bash
+export RELAY_DIR=/tmp/$USER/auth-relay
+mkdir -p "$RELAY_DIR"
+git clone https://github.com/parallelworks/auth-relay "$RELAY_DIR"
+bash "$RELAY_DIR/vdi/install-chrome.sh" "$RELAY_DIR"
+bash "$RELAY_DIR/vdi/bootstrap.sh"
+python3 "$RELAY_DIR/vdi/install-extension.py"
+```
 
 ---
 
