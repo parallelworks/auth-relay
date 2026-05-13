@@ -50,4 +50,20 @@ EOF
 # <user-data-dir>/NativeMessagingHosts/, NOT at the standard
 # ~/.config/google-chrome/NativeMessagingHosts/ path that bootstrap.sh
 # writes to. Forcing the default profile keeps the lookup wired up.
-exec "$CHROME" "$@"
+#
+# Redirect Chrome's stderr/stdout to a log file. Chrome dumps a *lot* of
+# debug info to stderr by default; left attached to a terminal that
+# launched the wrapper with `&`, it makes the shell unusable. The log
+# is at /tmp/pw-chrome.log if you need to inspect it.
+LOG="${PW_CHROME_LOG:-/tmp/pw-chrome-$(id -un).log}"
+
+# NOAA HPC login nodes (Gaea, Hera, ...) ship with ulimit -s = 1 GiB
+# (1048576 KiB), which Chrome inherits. Every pthread_create reserves
+# a stack mapping of that size; Chrome opens hundreds of threads and
+# quickly exhausts /proc/sys/vm/max_map_count or virtual address space,
+# yielding cascading "pthread_create: Resource temporarily unavailable"
+# crashpad loops. Pin the stack to a sensible Linux default (8 MiB).
+# The current-shell soft limit is what new processes inherit.
+ulimit -Ss 8192 2>/dev/null || true
+
+exec "$CHROME" "$@" </dev/null >>"$LOG" 2>&1
