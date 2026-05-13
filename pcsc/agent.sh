@@ -95,13 +95,17 @@ mkdir -p "$WORK_DIR"
 STDOUT_FILE="$WORK_DIR/server.out"
 trap 'rm -rf "$WORK_DIR"; jobs -p | xargs -r kill 2>/dev/null' EXIT INT TERM
 
-say "starting p11-kit server (socket-base: $WORK_DIR)"
+say "starting p11-kit server (provider: $OPENSC_MOD)"
 # --foreground keeps it attached so $! is the actual server PID (without
 # this flag p11-kit daemonizes and outlives the script).
+#
+# We deliberately do NOT pass --socket-base — older p11-kit versions
+# (notably Homebrew's macOS build) don't recognize it. Letting p11-kit
+# pick the socket location is fine: it announces the chosen path via
+# P11_KIT_SERVER_ADDRESS= on its stdout, which we parse below.
 p11-kit server \
     --foreground \
     --name pwrelay-cac \
-    --socket-base "$WORK_DIR" \
     --provider "$OPENSC_MOD" \
     "pkcs11:" \
     > "$STDOUT_FILE" 2>&1 &
