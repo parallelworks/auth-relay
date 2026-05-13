@@ -339,6 +339,12 @@ def main() -> int:
         "--password-store=basic",
         f"--remote-debugging-port={debug_port}",
         "--remote-allow-origins=*",
+        # Required for Extensions.loadUnpacked over the WS-based debug
+        # port. Without it Chrome 148 replies 'Method not available' to
+        # the CDP call. The 'unsafe' is Chrome's name for "exposes
+        # extension debugging APIs to DevTools clients" — only matters
+        # for the short window our installer holds the debug port open.
+        "--enable-unsafe-extension-debugging",
         # Land on chrome://extensions so the user sees the extension
         # actually show up the moment install-extension.py finishes.
         # Click "Inspect views: service worker" on that page to confirm
