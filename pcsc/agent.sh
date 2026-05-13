@@ -30,15 +30,23 @@ err() { printf '%s\n' "[pcsc-agent error] $*" >&2; }
 say() { printf '%s\n' "[pcsc-agent] $*"; }
 
 # ---- prereq checks --------------------------------------------------------
+#
+# Collect ALL missing prereqs in one pass and print a single block with the
+# exact install command. Avoids the "install one, hit the next, install
+# the next, hit another" loop.
 
+missing_pkgs=()
+missing_cmds=()
+
+# CLI tools.
 for cmd in p11-kit socat; do
-  command -v "$cmd" >/dev/null 2>&1 || {
-    err "$cmd not on PATH. Install via your package manager (brew/apt/yum)."
-    exit 1
-  }
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    missing_cmds+=("$cmd")
+    missing_pkgs+=("$cmd")
+  fi
 done
 
-# Find OpenSC's PKCS#11 module. Locations vary by OS / install method.
+# OpenSC PKCS#11 module — locations vary by OS / install method.
 OPENSC_MOD=""
 for cand in \
     /opt/homebrew/lib/opensc-pkcs11.so \
@@ -52,9 +60,24 @@ for cand in \
   fi
 done
 if [[ -z "$OPENSC_MOD" ]]; then
-  err "couldn't find opensc-pkcs11.so. Install OpenSC and retry."
-  err "  Mac:   brew install opensc"
-  err "  Linux: apt install opensc  (or dnf install opensc, etc.)"
+  missing_cmds+=("opensc-pkcs11.so")
+  missing_pkgs+=("opensc")
+fi
+
+if (( ${#missing_cmds[@]} > 0 )); then
+  cat >&2 <<EOF
+============================================================
+ CAC relay can't start — missing prereqs on this laptop:
+   - ${missing_cmds[*]}
+
+ Install them with ONE of these:
+   macOS (Homebrew):   brew install ${missing_pkgs[*]}
+   Debian / Ubuntu:    sudo apt install ${missing_pkgs[*]}
+   RHEL / Fedora:      sudo dnf install ${missing_pkgs[*]}
+
+ Then re-run:   ./pwrelay up <resource> --cac
+============================================================
+EOF
   exit 1
 fi
 say "using OpenSC PKCS#11 module: $OPENSC_MOD"
