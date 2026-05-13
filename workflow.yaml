@@ -47,6 +47,15 @@ sessions:
 on:
   execute:
     inputs:
+      resource:
+        type: compute-clusters
+        label: Target resource
+        include-workspace: true
+        autoselect: true
+        tooltip: |
+          Which system to install + bootstrap the relay on. Pick the
+          cluster (or workspace) where your VDI desktop session is
+          running. The workflow steps all run there via SSH.
       install_location:
         type: dropdown
         label: Install location
@@ -99,6 +108,8 @@ on:
 
 jobs:
   bootstrap:
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
     steps:
       - name: Resolve RELAY_DIR
         env:
@@ -234,6 +245,9 @@ jobs:
           EOF
 
   testpage_session:
+    needs: [bootstrap]
+    ssh:
+      remoteHost: ${{ inputs.resource.ip }}
     steps:
       - name: Wait for the local test-page server
         early-cancel: any-job-failed
@@ -252,4 +266,4 @@ jobs:
           remotePort: ${{ inputs.test_page_port }}
           name: ${{ sessions.testpage }}
           status: "running"
-          target: "user-workspace"
+          target: ${{ inputs.resource.id }}
