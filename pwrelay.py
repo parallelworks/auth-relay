@@ -281,13 +281,16 @@ def _spawn_tunnel_supervisor(resource: str, rs_user: str, port: int,
     # Each tunnel gets a distinct marker so `pkill -f marker` on the
     # remote at teardown only touches our own sleep, not the other relay.
     tunnel_marker = f"{session_id}-{label}"
+    known_hosts_file = "nul" if IS_WIN else "/dev/null"
 
-    # Spawn a Python subprocess that runs the supervisor loop. Doing this
-    # in Python rather than a shell `while true` keeps Windows happy.
-    supervisor_script = f"""
+    # Render the supervisor script via str.format, NOT an f-string, so the
+    # `{rc}` placeholders inside the inner `f'...{{rc}}...'` strings reach
+    # the child process literally. We only substitute the named fields
+    # explicitly listed below.
+    supervisor_script = """\
 import os, subprocess, sys, time
 
-LOG = open({str(log_path)!r}, 'a', buffering=1)
+LOG = open({log_path!r}, 'a', buffering=1)
 def log(msg):
     LOG.write(msg + '\\n')
 
@@ -297,7 +300,7 @@ while True:
          '-i', os.path.expanduser('~/.ssh/pwcli'),
          '-o', 'ProxyCommand=pw ssh --proxy-command %h',
          '-o', 'StrictHostKeyChecking=no',
-         '-o', 'UserKnownHostsFile=' + ({0!r} if {1} else '/dev/null'),
+         '-o', 'UserKnownHostsFile=' + {known_hosts!r},
          '-o', 'ServerAliveInterval=30',
          '-o', 'ServerAliveCountMax=3',
          '-o', 'TCPKeepAlive=yes',
@@ -312,7 +315,7 @@ while True:
     # Tail the log to look for terminal failures.
     LOG.flush()
     try:
-        tail = open({str(log_path)!r}).read()
+        tail = open({log_path!r}).read()
     except Exception:
         tail = ''
     if 'Permission denied' in tail or 'remote port forwarding failed' in tail:
@@ -320,7 +323,14 @@ while True:
         sys.exit(rc)
     log(f'[supervisor] ssh exited rc={{rc}} — reconnecting in 3s')
     time.sleep(3)
-""".format("nul", IS_WIN)
+""".format(
+        log_path=str(log_path),
+        known_hosts=known_hosts_file,
+        port=port,
+        rs_user=rs_user,
+        resource=resource,
+        tunnel_marker=tunnel_marker,
+    )
 
     proc = subprocess.Popen(
         [sys.executable, "-c", supervisor_script],
