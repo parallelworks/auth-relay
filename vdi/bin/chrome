@@ -87,4 +87,14 @@ fi
 # The current-shell soft limit is what new processes inherit.
 ulimit -Ss 8192 2>/dev/null || true
 
-exec "$CHROME" "$@" </dev/null >>"$LOG" 2>&1
+# Suppress Chrome's first-run UI gates that block headless / unattended
+# automation. Without these flags, the very first launch of a fresh
+# profile pops a "Make Chrome your default browser?" prompt that
+# blocks until dismissed; install-extension.py's CDP install times
+# out waiting for Chrome to fully come up.
+exec "$CHROME" \
+    --no-first-run \
+    --no-default-browser-check \
+    --disable-default-apps \
+    --disable-search-engine-choice-screen \
+    "$@" </dev/null >>"$LOG" 2>&1

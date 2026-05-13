@@ -311,6 +311,13 @@ def main() -> int:
     log = open(log_path, "ab")
     cmd = [
         chrome_bin,
+        # Suppress first-run UI gates that block CDP install on a fresh
+        # profile: the default-browser prompt, the welcome screen, and
+        # (since Chrome ~122) the search-engine-choice modal.
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-default-apps",
+        "--disable-search-engine-choice-screen",
         f"--remote-debugging-port={debug_port}",
         "--remote-allow-origins=*",
         # Land on chrome://extensions so the user sees the extension
