@@ -41,8 +41,6 @@ sessions:
     useTLS: false
     redirect: false
     useCustomDomain: false
-    prompt-for-name:
-      default: auth_relay_test
 
 on:
   execute:
