@@ -393,9 +393,10 @@ def main() -> int:
         start_new_session=True,
         env=env,
     )
-    # Parent doesn't need the ends it handed off to bash.
-    os.close(in_r)
-    os.close(out_w)
+    # subprocess closes in_r and out_w in the parent automatically after
+    # dup'ing them into the child as fd 0 / fd 1. Don't close them again
+    # (Errno 9, Bad file descriptor). We only keep in_w (for writing to
+    # Chrome) and out_r (for reading from Chrome).
     # Parent only keeps the two ends it talks to Chrome through.
     os.close(in_r)
     os.close(out_w)
