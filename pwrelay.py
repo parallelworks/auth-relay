@@ -46,16 +46,27 @@ HOME = Path.home()
 REPO_ROOT = Path(__file__).resolve().parent
 
 STATE_DIR = Path(tempfile.gettempdir())
+# FIDO2 (YubiKey, etc.) — port 7777, agent.py, tunnel
 PID_AGENT = STATE_DIR / "pwrelay-agent.pid"
 PID_TUNNEL = STATE_DIR / "pwrelay-tunnel.pid"
 PID_PORT = STATE_DIR / "pwrelay-port"
-PID_SESSION = STATE_DIR / "pwrelay-session"
-PID_RESOURCE = STATE_DIR / "pwrelay-resource"
 LOG_AGENT = STATE_DIR / "pwrelay-agent.log"
 LOG_TUNNEL = STATE_DIR / "pwrelay-tunnel.log"
 
+# CAC / PIV smartcard — port 7888, pcsc/agent.sh, tunnel
+PID_CAC_AGENT = STATE_DIR / "pwrelay-cac-agent.pid"
+PID_CAC_TUNNEL = STATE_DIR / "pwrelay-cac-tunnel.pid"
+PID_CAC_PORT = STATE_DIR / "pwrelay-cac-port"
+LOG_CAC_AGENT = STATE_DIR / "pwrelay-cac-agent.log"
+LOG_CAC_TUNNEL = STATE_DIR / "pwrelay-cac-tunnel.log"
+
+# Per-session bookkeeping (shared across FIDO + CAC).
+PID_SESSION = STATE_DIR / "pwrelay-session"
+PID_RESOURCE = STATE_DIR / "pwrelay-resource"
+
 DEFAULT_PORT = int(os.environ.get("PW_RELAY_PORT", "7777"))
-PORT_FALLBACK_RANGE = 8  # try 7777, 7778, ..., 7784
+DEFAULT_CAC_PORT = int(os.environ.get("PW_CAC_PORT", "7888"))
+PORT_FALLBACK_RANGE = 8  # try N, N+1, ..., N+7
 
 
 # ---------- helpers --------------------------------------------------------
@@ -253,21 +264,30 @@ def _probe_remote_port(resource: str, port: int) -> bool:
 
 
 def _spawn_tunnel_supervisor(resource: str, rs_user: str, port: int,
-                              session_id: str) -> int:
+                              session_id: str, log_path: Path,
+                              pid_path: Path, label: str = "fido") -> int:
     """Spawn a Python child process that runs ssh -R in a retry loop.
 
-    Returns the supervisor process PID. The supervisor writes activity to
-    LOG_TUNNEL; the parent can grep for the 'tunnel-up on' line to confirm
-    the tunnel is live before continuing.
+    Used identically for the FIDO (7777) and CAC (7888) tunnels — the
+    log/pid paths and a `label` (just for the session marker) are the
+    only differences.
+
+    Returns the supervisor process PID. The supervisor writes activity
+    to ``log_path``; the parent can grep for the 'tunnel-up on' line to
+    confirm the tunnel is live before continuing.
     """
-    LOG_TUNNEL.write_text("")  # truncate
+    log_path.write_text("")  # truncate
+
+    # Each tunnel gets a distinct marker so `pkill -f marker` on the
+    # remote at teardown only touches our own sleep, not the other relay.
+    tunnel_marker = f"{session_id}-{label}"
 
     # Spawn a Python subprocess that runs the supervisor loop. Doing this
     # in Python rather than a shell `while true` keeps Windows happy.
     supervisor_script = f"""
 import os, subprocess, sys, time
 
-LOG = open({str(LOG_TUNNEL)!r}, 'a', buffering=1)
+LOG = open({str(log_path)!r}, 'a', buffering=1)
 def log(msg):
     LOG.write(msg + '\\n')
 
@@ -284,15 +304,15 @@ while True:
          '-o', 'ExitOnForwardFailure=yes',
          '-R', '{port}:127.0.0.1:{port}',
          '{rs_user}@{resource}',
-         'echo \"[remote] tunnel-up on $(hostname); pid=$$ marker={session_id}\"; '
-         'exec -a \"{session_id}\" sleep 86400'],
+         'echo \"[remote] tunnel-up on $(hostname); pid=$$ marker={tunnel_marker}\"; '
+         'exec -a \"{tunnel_marker}\" sleep 86400'],
         stdout=LOG, stderr=LOG,
     ).returncode
 
     # Tail the log to look for terminal failures.
     LOG.flush()
     try:
-        tail = open({str(LOG_TUNNEL)!r}).read()
+        tail = open({str(log_path)!r}).read()
     except Exception:
         tail = ''
     if 'Permission denied' in tail or 'remote port forwarding failed' in tail:
@@ -304,21 +324,22 @@ while True:
 
     proc = subprocess.Popen(
         [sys.executable, "-c", supervisor_script],
-        stdout=open(LOG_TUNNEL, "ab"),
+        stdout=open(log_path, "ab"),
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
         **_detach_kwargs(),
     )
-    PID_TUNNEL.write_text(str(proc.pid))
+    pid_path.write_text(str(proc.pid))
     return proc.pid
 
 
-def _wait_for_tunnel_up(timeout: float = 20.0) -> str | None:
-    """Block until LOG_TUNNEL shows 'tunnel-up on ...'; return the host."""
+def _wait_for_tunnel_up(log_path: Path, pid_path: Path,
+                         timeout: float = 20.0) -> str | None:
+    """Block until ``log_path`` shows 'tunnel-up on ...'; return the host."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            text = LOG_TUNNEL.read_text()
+            text = log_path.read_text()
         except FileNotFoundError:
             text = ""
         m = re.search(r"\[remote\] tunnel-up on ([^;\s]+)", text)
@@ -332,98 +353,198 @@ def _wait_for_tunnel_up(timeout: float = 20.0) -> str | None:
             err("remote port still busy on the cluster (pw-agent may be caching it).")
             err("Try `./pwrelay reset <resource>` and re-run.")
             return None
-        if not _is_running(PID_TUNNEL):
+        if not _is_running(pid_path):
             return None
         time.sleep(0.5)
     return None
 
 
+def _spawn_cac_agent(port: int) -> int:
+    """Spawn pcsc/agent.sh as a detached background process.
+
+    Returns the agent's PID. The agent listens on 127.0.0.1:``port`` and
+    serves the local CAC card via p11-kit + socat.
+    """
+    if IS_WIN:
+        err("--cac is not supported on Windows yet (pcsc/agent.sh is bash-only).")
+        err("Track the Windows agent.py rewrite in docs/cac-relay-design.md.")
+        sys.exit(1)
+
+    agent_sh = REPO_ROOT / "pcsc" / "agent.sh"
+    if not agent_sh.exists():
+        err(f"missing CAC agent script at {agent_sh}")
+        sys.exit(1)
+
+    bash = shutil.which("bash")
+    if not bash:
+        err("--cac needs bash on PATH (couldn't find one).")
+        sys.exit(1)
+
+    LOG_CAC_AGENT.write_text("")  # truncate
+    env = os.environ.copy()
+    env["PW_CAC_PORT"] = str(port)
+    proc = subprocess.Popen(
+        [bash, str(agent_sh)],
+        env=env,
+        stdout=open(LOG_CAC_AGENT, "ab"),
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        **_detach_kwargs(),
+    )
+    PID_CAC_AGENT.write_text(str(proc.pid))
+    return proc.pid
+
+
+def _wait_for_cac_agent_up(timeout: float = 8.0) -> bool:
+    """Probe the CAC agent's listening port until it accepts a TCP conn."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _is_running(PID_CAC_AGENT):
+            return False
+        try:
+            port = int(PID_CAC_PORT.read_text().strip())
+        except Exception:
+            time.sleep(0.2); continue
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                return True
+        except OSError:
+            time.sleep(0.4)
+    return False
+
+
+def _pick_remote_port(resource: str, default: int, label: str) -> int:
+    """Walk default..default+RANGE looking for a free port on the remote."""
+    say(f"[{label}] checking which port is free on remote {resource} ...")
+    for cand in range(default, default + PORT_FALLBACK_RANGE):
+        if _probe_remote_port(resource, cand):
+            if cand != default:
+                say(f"[{label}] port {default} on remote is busy; using {cand}")
+            return cand
+    err(f"[{label}] no free port in {default}..{default + PORT_FALLBACK_RANGE - 1} on {resource}.")
+    err("try `pwrelay reset <resource>` and re-run.")
+    sys.exit(1)
+
+
 def cmd_up(args: argparse.Namespace) -> None:
     resource = _resolve_resource(args.resource)
 
-    if _is_running(PID_AGENT):
-        say(f"agent already running (pid {_read_pid(PID_AGENT)}). Use `pwrelay down` to stop.")
+    fido_enabled = not args.no_fido
+    cac_enabled = bool(args.cac)
+    if not fido_enabled and not cac_enabled:
+        err("nothing to do — both FIDO and CAC are disabled.")
+        err("drop --no-fido, or add --cac, or both.")
+        sys.exit(1)
+
+    if fido_enabled and _is_running(PID_AGENT):
+        say(f"FIDO agent already running (pid {_read_pid(PID_AGENT)}). Use `pwrelay down` first.")
+        sys.exit(1)
+    if cac_enabled and _is_running(PID_CAC_AGENT):
+        say(f"CAC agent already running (pid {_read_pid(PID_CAC_AGENT)}). Use `pwrelay down` first.")
         sys.exit(1)
 
     vp = _venv_python()
-    if not vp.exists():
+    if fido_enabled and not vp.exists():
         err("venv not found. Run: pwrelay setup")
         sys.exit(1)
-
-    # Port fallback: pw-agent on some clusters caches forward state and
-    # holds 7777 even with no client. Walk to next port if so.
-    say(f"checking which port is free on remote {resource} ...")
-    chosen_port: int | None = None
-    for cand in range(DEFAULT_PORT, DEFAULT_PORT + PORT_FALLBACK_RANGE):
-        if _probe_remote_port(resource, cand):
-            chosen_port = cand
-            break
-    if chosen_port is None:
-        err(f"no free port in {DEFAULT_PORT}..{DEFAULT_PORT + PORT_FALLBACK_RANGE - 1} on {resource}.")
-        err("try `pwrelay reset <resource>` and re-run.")
-        sys.exit(1)
-    if chosen_port != DEFAULT_PORT:
-        say(f"port {DEFAULT_PORT} on remote is busy; using {chosen_port}")
-    PID_PORT.write_text(str(chosen_port))
-    PID_RESOURCE.write_text(resource)
 
     rs_user = _resource_user()
     session_id = f"pwrelay-{int(time.time())}-{os.getpid()}"
     PID_SESSION.write_text(session_id)
+    PID_RESOURCE.write_text(resource)
 
-    # Push chosen port to a hint file on the remote so the NMH wrapper
-    # picks it up on its next spawn.
-    try:
-        subprocess.run(
-            ["pw", "ssh", resource,
-             f"echo {chosen_port} > /tmp/pw-relay-port-{rs_user}"],
-            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    # ---- FIDO2 side --------------------------------------------------------
+    chosen_port: int | None = None
+    if fido_enabled:
+        chosen_port = _pick_remote_port(resource, DEFAULT_PORT, "fido")
+        PID_PORT.write_text(str(chosen_port))
+
+        # Push chosen port to a hint file on the remote so the NMH wrapper
+        # picks it up on its next spawn.
+        try:
+            subprocess.run(
+                ["pw", "ssh", resource,
+                 f"echo {chosen_port} > /tmp/pw-relay-port-{rs_user}"],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+        say(f"starting FIDO agent on 127.0.0.1:{chosen_port}")
+        agent_proc = subprocess.Popen(
+            [str(vp), str(REPO_ROOT / "laptop" / "agent.py"), "--port", str(chosen_port)],
+            stdout=open(LOG_AGENT, "ab"), stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            **_detach_kwargs(),
         )
-    except Exception:
-        pass
+        PID_AGENT.write_text(str(agent_proc.pid))
+        time.sleep(0.6)
+        if not _is_running(PID_AGENT):
+            err(f"FIDO agent failed to start; tail {LOG_AGENT}")
+            try: sys.stderr.write(LOG_AGENT.read_text()[-2000:])
+            except Exception: pass
+            sys.exit(1)
+        ok(f"FIDO agent listening on 127.0.0.1:{chosen_port}")
 
-    # Start the agent.
-    say(f"starting agent on 127.0.0.1:{chosen_port}")
-    agent_log = open(LOG_AGENT, "ab")
-    agent_proc = subprocess.Popen(
-        [str(vp), str(REPO_ROOT / "laptop" / "agent.py"), "--port", str(chosen_port)],
-        stdout=agent_log, stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        **_detach_kwargs(),
-    )
-    PID_AGENT.write_text(str(agent_proc.pid))
-    time.sleep(0.6)
-    if not _is_running(PID_AGENT):
-        err(f"agent failed to start; tail {LOG_AGENT}")
-        try: sys.stderr.write(LOG_AGENT.read_text()[-2000:])
-        except Exception: pass
-        sys.exit(1)
-    ok(f"agent listening on 127.0.0.1:{chosen_port}")
+        say(f"opening FIDO reverse tunnel to {rs_user}@{resource} [auto-reconnect, port {chosen_port}]")
+        _spawn_tunnel_supervisor(resource, rs_user, chosen_port, session_id,
+                                  LOG_TUNNEL, PID_TUNNEL, label="fido")
+        rhost = _wait_for_tunnel_up(LOG_TUNNEL, PID_TUNNEL)
+        if not rhost:
+            err("FIDO tunnel didn't come up; tail of " + str(LOG_TUNNEL))
+            try: sys.stderr.write(LOG_TUNNEL.read_text()[-2000:])
+            except Exception: pass
+            cmd_down(args)
+            sys.exit(1)
+        ok(f"FIDO tunnel up to {rhost} — port {chosen_port} on remote -> agent on this laptop")
 
-    # Tunnel supervisor.
-    say(f"opening reverse tunnel via pw ssh to {resource} ({rs_user}@{resource}) [auto-reconnect, port {chosen_port}]")
-    _spawn_tunnel_supervisor(resource, rs_user, chosen_port, session_id)
+    # ---- CAC / PIV side ----------------------------------------------------
+    cac_port: int | None = None
+    if cac_enabled:
+        cac_port = _pick_remote_port(resource, DEFAULT_CAC_PORT, "cac")
+        PID_CAC_PORT.write_text(str(cac_port))
 
-    rhost = _wait_for_tunnel_up()
-    if not rhost:
-        err("tunnel didn't come up; tail of " + str(LOG_TUNNEL))
-        try: sys.stderr.write(LOG_TUNNEL.read_text()[-2000:])
-        except Exception: pass
-        cmd_down(args)
-        sys.exit(1)
-    ok(f"tunnel up to {rhost} — port {chosen_port} on remote -> agent on this laptop")
+        say(f"starting CAC agent on 127.0.0.1:{cac_port}")
+        _spawn_cac_agent(cac_port)
+        if not _wait_for_cac_agent_up():
+            err(f"CAC agent failed to come up; tail {LOG_CAC_AGENT}")
+            try: sys.stderr.write(LOG_CAC_AGENT.read_text()[-2000:])
+            except Exception: pass
+            cmd_down(args)
+            sys.exit(1)
+        ok(f"CAC agent listening on 127.0.0.1:{cac_port}")
 
-    print("""
+        say(f"opening CAC reverse tunnel to {rs_user}@{resource} [auto-reconnect, port {cac_port}]")
+        _spawn_tunnel_supervisor(resource, rs_user, cac_port, session_id,
+                                  LOG_CAC_TUNNEL, PID_CAC_TUNNEL, label="cac")
+        rhost = _wait_for_tunnel_up(LOG_CAC_TUNNEL, PID_CAC_TUNNEL)
+        if not rhost:
+            err("CAC tunnel didn't come up; tail of " + str(LOG_CAC_TUNNEL))
+            try: sys.stderr.write(LOG_CAC_TUNNEL.read_text()[-2000:])
+            except Exception: pass
+            cmd_down(args)
+            sys.exit(1)
+        ok(f"CAC tunnel up to {rhost} — port {cac_port} on remote -> CAC agent on this laptop")
+
+    # ---- summary -----------------------------------------------------------
+    enabled_bits = []
+    if fido_enabled: enabled_bits.append(f"FIDO2 :{chosen_port}")
+    if cac_enabled:  enabled_bits.append(f"CAC/PIV :{cac_port}")
+    summary = " + ".join(enabled_bits)
+    print(f"""
 ────────────────────────────────────────────────────────────────────
- Relay live. On the VDI side:
-   - The ACTIVATE auth_relay workflow should already be running
-   - Or run manually: bash <repo>/vdi/bootstrap.sh; python3 install-extension.py
- Then open accounts.google.com / your SSO portal in the VDI Chrome.
- Ctrl+C here tears down the agent and tunnel cleanly.
+ Relay live ({summary}). On the VDI side:
+   - Run the ACTIVATE workflow (parallel.works > Workflows > auth-relay)
+   - Or manually:  bash <repo>/vdi/bootstrap.sh
+                  python3 <repo>/vdi/install-extension.py
+                  bash <repo>/pcsc/bootstrap.sh   # if you enabled --cac
+ Sign in to anywhere that uses WebAuthn or CAC TLS auth.
+ Ctrl+C here tears down everything cleanly.
 ────────────────────────────────────────────────────────────────────
 """)
 
-    # Foreground: tail the agent log until Ctrl+C.
+    # Foreground: tail whichever log is most useful. FIDO is chatty, CAC
+    # is mostly silent — prefer FIDO if it's running.
     def _on_sigint(*_a) -> None:
         print()
         cmd_down(args)
@@ -433,7 +554,8 @@ def cmd_up(args: argparse.Namespace) -> None:
         try: signal.signal(signal.SIGTERM, _on_sigint)
         except (ValueError, OSError): pass
 
-    _tail_file(LOG_AGENT)
+    tail_target = LOG_AGENT if fido_enabled else LOG_CAC_AGENT
+    _tail_file(tail_target)
 
 
 def _tail_file(path: Path) -> None:
@@ -454,8 +576,8 @@ def _tail_file(path: Path) -> None:
 
 
 def cmd_down(args: argparse.Namespace) -> None:
-    # Best-effort: tell the remote to kill our tagged sleep so the pw
-    # agent releases the port faster. Never touch the agent itself.
+    # Best-effort: tell the remote to kill our tagged sleeps so the pw
+    # agent releases the ports faster. Never touch the pw agent itself.
     sid_path = PID_SESSION
     res_path = PID_RESOURCE
     if sid_path.exists() and res_path.exists():
@@ -463,57 +585,70 @@ def cmd_down(args: argparse.Namespace) -> None:
         res = res_path.read_text().strip()
         if sid and res:
             say(f"asking remote ({res}) to release our session marker '{sid}'")
+            # Match all sleeps tagged with this session (both -fido and -cac).
             subprocess.run(
                 ["pw", "ssh", res,
                  f"pkill -u $(whoami) -f \"{sid}\" 2>/dev/null; true"],
                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-    _stop_pid(PID_TUNNEL, "ssh tunnel")
-    _stop_pid(PID_AGENT, "agent")
-    for p in (PID_PORT, PID_SESSION, PID_RESOURCE):
+    _stop_pid(PID_TUNNEL, "FIDO ssh tunnel")
+    _stop_pid(PID_AGENT, "FIDO agent")
+    _stop_pid(PID_CAC_TUNNEL, "CAC ssh tunnel")
+    _stop_pid(PID_CAC_AGENT, "CAC agent")
+    for p in (PID_PORT, PID_CAC_PORT, PID_SESSION, PID_RESOURCE):
         try: p.unlink()
         except FileNotFoundError: pass
     ok("relay stopped")
 
 
+def _status_line(name: str, pid_path: Path, log_path: Path | None = None) -> None:
+    if _is_running(pid_path):
+        ok(f"{name}: running (pid {_read_pid(pid_path)})")
+        if log_path is not None:
+            try:
+                lines = log_path.read_text().splitlines()
+                up = [l for l in lines if "tunnel-up on" in l]
+                if up:
+                    print(" ", up[-1])
+            except FileNotFoundError:
+                pass
+    else:
+        say(f"{name}: not running")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
-    if _is_running(PID_AGENT):
-        ok(f"agent: running (pid {_read_pid(PID_AGENT)})")
-    else:
-        say("agent: not running")
-    if _is_running(PID_TUNNEL):
-        ok(f"tunnel: running (pid {_read_pid(PID_TUNNEL)})")
-        try:
-            lines = LOG_TUNNEL.read_text().splitlines()
-            up = [l for l in lines if "tunnel-up on" in l]
-            if up:
-                print(" ", up[-1])
-        except FileNotFoundError:
-            pass
-    else:
-        say("tunnel: not running")
+    _status_line("FIDO agent",  PID_AGENT)
+    _status_line("FIDO tunnel", PID_TUNNEL, LOG_TUNNEL)
+    _status_line("CAC agent",   PID_CAC_AGENT)
+    _status_line("CAC tunnel",  PID_CAC_TUNNEL, LOG_CAC_TUNNEL)
 
 
 def cmd_doctor(args: argparse.Namespace) -> None:
     resource = _resolve_resource(args.resource)
     say("=== local (this laptop) ===")
     cmd_status(args)
-    print(f"  port file : {PID_PORT.read_text().strip() if PID_PORT.exists() else '(none)'}")
-    print(f"  session   : {PID_SESSION.read_text().strip() if PID_SESSION.exists() else '(none)'}")
-    print(f"  resource  : {PID_RESOURCE.read_text().strip() if PID_RESOURCE.exists() else '(none)'}")
-    print("  agent log tail:")
+    print(f"  fido port  : {PID_PORT.read_text().strip() if PID_PORT.exists() else '(none)'}")
+    print(f"  cac port   : {PID_CAC_PORT.read_text().strip() if PID_CAC_PORT.exists() else '(none)'}")
+    print(f"  session    : {PID_SESSION.read_text().strip() if PID_SESSION.exists() else '(none)'}")
+    print(f"  resource   : {PID_RESOURCE.read_text().strip() if PID_RESOURCE.exists() else '(none)'}")
+    print("  fido agent log tail:")
     _print_tail(LOG_AGENT, 3)
-    print("  tunnel log tail:")
+    print("  fido tunnel log tail:")
     _print_tail(LOG_TUNNEL, 5)
+    print("  cac agent log tail:")
+    _print_tail(LOG_CAC_AGENT, 3)
+    print("  cac tunnel log tail:")
+    _print_tail(LOG_CAC_TUNNEL, 5)
     print()
     say(f"=== remote ({resource}) ===")
+    # Grep for relay ports (777x and 788x) on the remote.
     subprocess.run(
         ["pw", "ssh", resource,
          """
 echo "  hostname  : $(hostname)"
 echo "  whoami    : $(whoami)"
-echo "  ports 7777..7785 (listening):"
-ss -tlnp 2>/dev/null | awk '/:777[0-9] /{ printf "    %s  %s\\n", $4, $6 }'
+echo "  relay ports (listening, 777x for FIDO + 788x for CAC):"
+ss -tlnp 2>/dev/null | awk '/:(777[0-9]|788[0-9]) /{ printf "    %s  %s\\n", $4, $6 }'
 echo "  my pwrelay-tagged sleeps (safe to kill via pwrelay reset):"
 ps -u "$(whoami)" -o pid,comm 2>/dev/null | awk '/pwrelay-/{ printf "    pid=%s argv0=%s\\n", $1, $2 }'
 echo "  pw agent (DO NOT KILL):"
@@ -534,6 +669,8 @@ def cmd_reset(args: argparse.Namespace) -> None:
     # Also catch any leaked agent processes
     if not IS_WIN:
         subprocess.run(["pkill", "-f", str(REPO_ROOT / "laptop" / "agent.py")],
+                       check=False)
+        subprocess.run(["pkill", "-f", str(REPO_ROOT / "pcsc" / "agent.sh")],
                        check=False)
     if resource:
         say(f"asking {resource} to kill ALL pwrelay-tagged sleeps for this user")
@@ -563,6 +700,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("setup")
     p_up = sub.add_parser("up")
     p_up.add_argument("resource", nargs="?", default=None)
+    p_up.add_argument(
+        "--cac", action="store_true",
+        help="also expose the laptop CAC/PIV smartcard to the VDI (port 7888). "
+             "Requires pcsc/agent.sh prereqs (opensc + p11-kit + socat). "
+             "Not supported on Windows yet — see docs/cac-relay-design.md.")
+    p_up.add_argument(
+        "--no-fido", action="store_true",
+        help="skip the FIDO2 (YubiKey) tunnel entirely. Pair with --cac for "
+             "CAC-only operation.")
     sub.add_parser("down")
     sub.add_parser("stop")
     sub.add_parser("status")
