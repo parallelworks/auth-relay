@@ -36,12 +36,6 @@
 permissions:
   - "*"
 
-sessions:
-  testpage:
-    useTLS: false
-    redirect: false
-    useCustomDomain: false
-
 on:
   execute:
     inputs:
@@ -95,14 +89,6 @@ on:
           Run vdi/install-extension.py after bootstrap. Will auto-detect
           your running Xvnc/Xkasmvnc and pop Chrome into that display.
           Disable if you only want the NMH and Desktop launcher staged.
-      test_page_port:
-        type: number
-        label: Test-page HTTP port
-        default: 8080
-        tooltip: |
-          Port for the local-RP test page (vdi/test.html). The test page
-          itself is rendered by the in-VDI Chrome; this also gets
-          exposed as an ACTIVATE session below for convenience.
 
 jobs:
   bootstrap:
@@ -235,16 +221,19 @@ jobs:
           # the user-data-dir so it auto-loads on the next launch.
           #
           # Now spawn a *persistent* Chrome via the wrapper (no debug
-          # pipe), detached so it survives the workflow runner exiting.
-          # The extension auto-loads from Preferences and the user sees
-          # a Chrome window in their VDI desktop with everything wired.
-          echo "==> launching persistent Chrome via wrapper"
-          setsid nohup "$RELAY_DIR/vdi/bin/chrome" chrome://extensions \
-            </dev/null >>"/tmp/pw-chrome-$USER.log" 2>&1 &
+          # pipe), DOUBLE-detached so it survives the workflow runner
+          # exiting. `setsid --fork` makes setsid fork once (so the
+          # process is reparented to init), `nohup` ignores SIGHUP from
+          # ssh disconnect, and the outer subshell + < /dev/null
+          # disconnects from the controlling tty. Logs to a fixed path.
+          echo "==> launching persistent Chrome via wrapper (detached)"
+          ( setsid --fork nohup "$RELAY_DIR/vdi/bin/chrome" chrome://extensions \
+              </dev/null >>"/tmp/pw-chrome-$USER.log" 2>&1 ) </dev/null >/dev/null 2>&1 &
           disown
-          # Give it a moment to spin up and report visible procs.
-          sleep 3
-          pgrep -afu "$USER" "chrome-portable/opt/google/chrome/chrome\$" | head -2 || true
+          sleep 4
+          echo "chrome procs after detach:"
+          pgrep -afu "$USER" "chrome-portable/opt/google/chrome/chrome\$" | head -2 || \
+            echo "  (none visible yet — Chrome may still be starting; check /tmp/pw-chrome-$USER.log on the cluster)"
 
       - name: Print laptop-side next steps
         run: |
@@ -262,46 +251,3 @@ jobs:
           echo "   - Touch your laptop YubiKey when prompted"
           echo "============================================================"
 
-  testpage_session:
-    needs: [bootstrap]
-    ssh:
-      remoteHost: ${{ inputs.resource.ip }}
-    steps:
-      - name: Wait for the local test-page server
-        early-cancel: any-job-failed
-        env:
-          host: localhost
-          port: ${{ inputs.test_page_port }}
-        retry:
-          interval: 3s
-          max-retries: 100
-          timeout: 5s
-        run: curl --fail --silent "http://${host}:${port}/test.html" >/dev/null 2>&1
-
-      - name: Expose test page as an ACTIVATE session
-        uses: parallelworks/update-session
-        with:
-          remotePort: ${{ inputs.test_page_port }}
-          name: ${{ sessions.testpage }}
-          status: "running"
-          target: ${{ inputs.resource.id }}
-          slug: /test.html
-
-      - name: Hold the workflow open so the ACTIVATE session stays registered
-        # ACTIVATE keeps the proxied test-page session live for as long
-        # as the workflow that registered it is running. Block here so
-        # the user can use the test page (and the relay) for the full
-        # length of their VDI session. The block exits naturally when:
-        #   - the user clicks "Stop session" in ACTIVATE (SIGTERM)
-        #   - the http.server actually dies (e.g., node reboot)
-        # The setsid'd http.server from bootstrap.sh outlives this
-        # loop's parent (the workflow runner), so the loop reliably
-        # detects "server still up" until the user stops the workflow.
-        run: |
-          set -e
-          PORT="${{ inputs.test_page_port }}"
-          echo "[keep-alive] holding session — workflow runs until you click Stop"
-          while ss -tlnp 2>/dev/null | grep -q ":${PORT} " ; do
-            sleep 30
-          done
-          echo "[keep-alive] test-page server is no longer listening on :${PORT}; exiting"
