@@ -89,12 +89,18 @@ ulimit -Ss 8192 2>/dev/null || true
 
 # Suppress Chrome's first-run UI gates that block headless / unattended
 # automation. Without these flags, the very first launch of a fresh
-# profile pops a "Make Chrome your default browser?" prompt that
-# blocks until dismissed; install-extension.py's CDP install times
-# out waiting for Chrome to fully come up.
+# profile blocks on a series of dialogs:
+#   - "Make Chrome your default browser?"        --no-default-browser-check
+#   - "Welcome to Chrome" first-run UI           --no-first-run
+#   - Search-engine-choice modal (Chrome 122+)   --disable-search-engine-choice-screen
+#   - gnome-keyring / kwallet "create password"  --password-store=basic
+# The keyring one bit us on Rocky Linux 9 inside a VDI: Chrome's secret-
+# service request pops a modal that steals focus and silently blocks
+# install-extension.py's CDP Extensions.loadUnpacked.
 exec "$CHROME" \
     --no-first-run \
     --no-default-browser-check \
     --disable-default-apps \
     --disable-search-engine-choice-screen \
+    --password-store=basic \
     "$@" </dev/null >>"$LOG" 2>&1

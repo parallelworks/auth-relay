@@ -312,12 +312,17 @@ def main() -> int:
     cmd = [
         chrome_bin,
         # Suppress first-run UI gates that block CDP install on a fresh
-        # profile: the default-browser prompt, the welcome screen, and
-        # (since Chrome ~122) the search-engine-choice modal.
+        # profile: the default-browser prompt, the welcome screen,
+        # (since Chrome ~122) the search-engine-choice modal, and the
+        # gnome-keyring / kwallet "create password" modal (caught on
+        # Rocky Linux 9 in the NOAA google-cluster VDI — Chrome's
+        # secret-service request silently stalled Extensions.loadUnpacked
+        # because the modal stole focus).
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-default-apps",
         "--disable-search-engine-choice-screen",
+        "--password-store=basic",
         f"--remote-debugging-port={debug_port}",
         "--remote-allow-origins=*",
         # Land on chrome://extensions so the user sees the extension
