@@ -11,7 +11,8 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$HERE/.." && pwd)"
+# This script lives at <repo>/vdi/bin/chrome — two parents up to the repo.
+REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 
 find_chrome() {
   if [[ -n "${PW_CHROME_BIN:-}" && -x "${PW_CHROME_BIN}" ]]; then
@@ -40,7 +41,7 @@ CHROME="$(find_chrome)" || {
 no Chrome binary found.
 
 Set PW_CHROME_BIN to your install, or run:
-    bash $REPO_ROOT/vdi/install-chrome.sh [<install-prefix>]
+    bash ${REPO_ROOT}/vdi/install-chrome.sh [<install-prefix>]
 EOF
   exit 1
 }
