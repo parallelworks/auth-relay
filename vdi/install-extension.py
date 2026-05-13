@@ -62,6 +62,7 @@ import argparse
 import base64
 import json
 import secrets
+import shlex
 import shutil
 import socket
 import struct
@@ -364,43 +365,37 @@ def main() -> int:
             resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
     except Exception as e:
         print(f"[install] could not clamp stack rlimit: {e}", file=sys.stderr)
-    # Chrome's pipe-based CDP expects fd 3 = stdin, fd 4 = stdout.
-    # We dup the read end of the in-pipe to fd 3 and the write end of
-    # the out-pipe to fd 4 in the child before exec. We have to list
-    # both 3 and 4 in pass_fds — subprocess's close-fds loop runs
-    # AFTER preexec_fn, and without 3/4 in the keep-list it'd close
-    # the descriptors we just dup'd. (Chrome's complaint without this:
-    # 'Remote debugging pipe file descriptors are not open'.)
-    def _child_setup() -> None:
-        # dup2(inheritable=True) is the Python 3 default and produces
-        # fd 3 / fd 4 with FD_CLOEXEC CLEARED, so they survive exec.
-        # We still re-assert via set_inheritable to be defensive against
-        # libc / glibc layers that may flip CLOEXEC back on.
-        os.dup2(in_r, 3, inheritable=True)
-        os.dup2(out_w, 4, inheritable=True)
-        os.set_inheritable(3, True)
-        os.set_inheritable(4, True)
-        # Drop the original pipe fds; only 3/4 should survive into exec.
-        for fd in (in_r, in_w, out_r, out_w):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+    # Chrome's pipe-based CDP expects fd 3 = stdin, fd 4 = stdout, with
+    # CLOEXEC clear so they survive exec. We tried doing this in a
+    # subprocess preexec_fn dup2 — Chrome kept reporting "Remote
+    # debugging pipe file descriptors are not open", strongly suggesting
+    # either CPython's pre-exec fd plumbing was closing them or the
+    # CLOEXEC flag was being set somewhere we couldn't see.
+    #
+    # The robust workaround is a tiny bash wrapper. We give bash stdin
+    # = our in_r and stdout = our out_w via subprocess.Popen (which
+    # subprocess sets up reliably), then the shell redirects fd 0->3,
+    # fd 1->4 before exec'ing Chrome. Both POSIX redirection (3<&0,
+    # 4>&1) and the chmod-style F_DUPFD it implies clear CLOEXEC by
+    # spec, so Chrome gets clean fd 3/4.
+    chrome_argv = shlex.join(cmd)
+    shell_cmd = (
+        "exec 3<&0 4>&1 "        # alias stdin -> fd 3, stdout -> fd 4
+        "0</dev/null 1>&2; "     # detach stdin/stdout from the original pipes
+        "exec " + chrome_argv    # replace bash with chrome
+    )
 
-    # close_fds=False lets us bypass subprocess's close-loop entirely.
-    # preexec_fn does the dup2 to fd 3/4 and we trust the child not to
-    # do anything sensitive before exec. This avoids the close-fds vs
-    # preexec_fn ordering edge case that was closing our dup'd fds.
     proc = subprocess.Popen(
-        cmd,
-        stdout=log,
+        ["bash", "-c", shell_cmd],
+        stdin=in_r,
+        stdout=out_w,
         stderr=log,
-        stdin=subprocess.DEVNULL,
         start_new_session=True,
         env=env,
-        close_fds=False,
-        preexec_fn=_child_setup,
     )
+    # Parent doesn't need the ends it handed off to bash.
+    os.close(in_r)
+    os.close(out_w)
     # Parent only keeps the two ends it talks to Chrome through.
     os.close(in_r)
     os.close(out_w)
