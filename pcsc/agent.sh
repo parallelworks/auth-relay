@@ -100,22 +100,40 @@ say "starting p11-kit server (provider: $OPENSC_MOD)"
 # this flag p11-kit daemonizes and outlives the script).
 #
 # We deliberately do NOT pass --socket-base — older p11-kit versions
-# (notably Homebrew's macOS build) don't recognize it. Letting p11-kit
-# pick the socket location is fine: it announces the chosen path via
+# (Homebrew's macOS build) don't recognize it. Letting p11-kit pick the
+# socket location is fine: it announces the chosen path via
 # P11_KIT_SERVER_ADDRESS= on its stdout, which we parse below.
-p11-kit server \
-    --foreground \
-    --name pwrelay-cac \
-    --provider "$OPENSC_MOD" \
-    "pkcs11:" \
-    > "$STDOUT_FILE" 2>&1 &
-P11_PID=$!
+#
+# IMPORTANT: cd into WORK_DIR before launching p11-kit. Homebrew's
+# p11-kit creates the socket as a *relative* path (just the --name
+# value, e.g. "pwrelay-cac") — which means it lands in $PWD. With cwd
+# = WORK_DIR, the socket file is at $WORK_DIR/pwrelay-cac, an absolute
+# location both processes (p11-kit, socat) agree on. Without the cd,
+# the socket lands wherever the script was invoked from and socat's
+# UNIX-CONNECT misses it.
+(
+  cd "$WORK_DIR"
+  p11-kit server \
+      --foreground \
+      --name pwrelay-cac \
+      --provider "$OPENSC_MOD" \
+      "pkcs11:" \
+      > "$STDOUT_FILE" 2>&1 &
+  echo $! > "$WORK_DIR/p11.pid"
+)
+P11_PID=$(cat "$WORK_DIR/p11.pid")
 
 SOCKET=""
 for _ in $(seq 1 50); do  # up to ~10s
   if grep -q '^P11_KIT_SERVER_ADDRESS=' "$STDOUT_FILE" 2>/dev/null; then
-    SOCKET=$(grep -m1 '^P11_KIT_SERVER_ADDRESS=' "$STDOUT_FILE" \
+    raw=$(grep -m1 '^P11_KIT_SERVER_ADDRESS=' "$STDOUT_FILE" \
               | sed -E 's|^P11_KIT_SERVER_ADDRESS=unix:path=([^;]+);?.*|\1|')
+    # Normalize relative -> absolute against WORK_DIR (where we cd'd
+    # before launching p11-kit, so this is where it dropped the file).
+    case "$raw" in
+      /*) SOCKET="$raw" ;;
+      *)  SOCKET="$WORK_DIR/$raw" ;;
+    esac
     [[ -S "$SOCKET" ]] && break
   fi
   if ! kill -0 "$P11_PID" 2>/dev/null; then
