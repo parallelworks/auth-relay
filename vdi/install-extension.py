@@ -387,6 +387,10 @@ def main() -> int:
             except OSError:
                 pass
 
+    # close_fds=False lets us bypass subprocess's close-loop entirely.
+    # preexec_fn does the dup2 to fd 3/4 and we trust the child not to
+    # do anything sensitive before exec. This avoids the close-fds vs
+    # preexec_fn ordering edge case that was closing our dup'd fds.
     proc = subprocess.Popen(
         cmd,
         stdout=log,
@@ -394,7 +398,7 @@ def main() -> int:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         env=env,
-        pass_fds=(3, 4, in_r, out_w),
+        close_fds=False,
         preexec_fn=_child_setup,
     )
     # Parent only keeps the two ends it talks to Chrome through.
