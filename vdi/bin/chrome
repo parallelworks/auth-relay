@@ -86,14 +86,27 @@ if [[ -z "${DISPLAY:-}" ]]; then
   fi
 fi
 
-# NOAA HPC login nodes (Gaea, Hera, ...) ship with ulimit -s = 1 GiB
-# (1048576 KiB), which Chrome inherits. Every pthread_create reserves
-# a stack mapping of that size; Chrome opens hundreds of threads and
-# quickly exhausts /proc/sys/vm/max_map_count or virtual address space,
-# yielding cascading "pthread_create: Resource temporarily unavailable"
-# crashpad loops. Pin the stack to a sensible Linux default (8 MiB).
-# The current-shell soft limit is what new processes inherit.
+# HPC login-node ulimit fixes. Chrome is greedy in several dimensions
+# that hit defaults on shared servers:
+#
+#   stack size  (-s)  1 GiB     (NOAA Gaea default) — per-thread stack
+#                               mapping blows /proc/sys/vm/max_map_count
+#                               and we see cascading 'pthread_create:
+#                               Resource temporarily unavailable'.
+#   max procs   (-u)  1024      (NOAA Ursa default) — Chrome easily
+#                               needs 50+ procs (renderers, GPU, NMH,
+#                               utility, network, ...) and freezes when
+#                               it can't fork more.
+#   open files  (-n)  6400      (NOAA Ursa default) — Chrome holds lots
+#                               of fds for cache, sockets, IPC pipes.
+#
+# Raise each to the hard cap (or a sensible default) without ever
+# requiring root. The soft limit is what new processes inherit.
 ulimit -Ss 8192 2>/dev/null || true
+_hardu="$(ulimit -Hu 2>/dev/null || echo 4096)"
+_hardn="$(ulimit -Hn 2>/dev/null || echo 65536)"
+ulimit -Su "$_hardu" 2>/dev/null || true
+ulimit -Sn "$_hardn" 2>/dev/null || true
 
 # Suppress Chrome's first-run UI gates that block headless / unattended
 # automation. Without these flags, the very first launch of a fresh
@@ -105,6 +118,20 @@ ulimit -Ss 8192 2>/dev/null || true
 # The keyring one bit us on Rocky Linux 9 inside a VDI: Chrome's secret-
 # service request pops a modal that steals focus and silently blocks
 # install-extension.py's CDP Extensions.loadUnpacked.
+#
+# Additional flags to keep Chrome stable on machines without a real GPU
+# (most VDI / login nodes). Without them Chrome's on-device-model
+# service crash-loops trying to init Vulkan against SwiftShader, and
+# the GPU process eats CPU spinning on EGL/GLX errors. Symptoms on the
+# Google cloud cluster pre-fix: "very slow then eventually fails".
+#
+#   --disable-gpu                       skip GPU acceleration entirely
+#   --disable-software-rasterizer       skip the CPU rasterizer fallback
+#   --disable-features=...              turn off services that need a real
+#                                       GPU/Vulkan: on-device AI, video
+#                                       decoder accel, viz display compositor
+#   --renderer-process-limit=4          cap renderer forks; relevant on
+#                                       Ursa where ulimit -u was 1024
 exec "$CHROME" \
     --user-data-dir="$PW_CHROME_USER_DATA_DIR" \
     --no-first-run \
@@ -112,4 +139,8 @@ exec "$CHROME" \
     --disable-default-apps \
     --disable-search-engine-choice-screen \
     --password-store=basic \
+    --disable-gpu \
+    --disable-software-rasterizer \
+    --disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer \
+    --renderer-process-limit=4 \
     "$@" </dev/null >>"$LOG" 2>&1
