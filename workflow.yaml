@@ -110,28 +110,37 @@ jobs:
   bootstrap:
     ssh:
       remoteHost: ${{ inputs.resource.ip }}
+    env:
+      INSTALL_LOCATION: ${{ inputs.install_location }}
+      CUSTOM_DIR: ${{ inputs.custom_relay_dir }}
+      BRANCH: ${{ inputs.branch }}
+      SEED_BOOKMARKS: ${{ inputs.seed_bookmarks }}
     steps:
-      - name: Resolve RELAY_DIR
-        env:
-          INSTALL_LOCATION: ${{ inputs.install_location }}
-          CUSTOM_DIR: ${{ inputs.custom_relay_dir }}
+      # ACTIVATE doesn't expose $GITHUB_ENV for cross-step variable
+      # sharing the way GitHub Actions does, so each step that needs
+      # RELAY_DIR re-resolves it from the same env-derived case. The
+      # scripts are written POSIX-portable (no [[ ]]) because the
+      # runner may invoke them under /bin/sh on some hosts.
+      - name: Install + bootstrap auth-relay on remote
         run: |
           set -e
+
+          # ---- resolve RELAY_DIR --------------------------------------
           case "$INSTALL_LOCATION" in
             home)
               RELAY_DIR="$HOME/auth-relay"
               ;;
             tmp)
               RELAY_DIR="/tmp/$USER/auth-relay"
-              mkdir -p "$(dirname "$RELAY_DIR")"
+              mkdir -p "/tmp/$USER"
               ;;
             existing)
-              if [[ -n "$CUSTOM_DIR" ]]; then
+              if [ -n "$CUSTOM_DIR" ]; then
                 RELAY_DIR="$CUSTOM_DIR"
               else
                 RELAY_DIR="$HOME/auth-relay"
               fi
-              if [[ ! -d "$RELAY_DIR" ]]; then
+              if [ ! -d "$RELAY_DIR" ]; then
                 echo "ERROR: 'Use existing' selected but $RELAY_DIR does not exist" >&2
                 exit 1
               fi
@@ -140,37 +149,30 @@ jobs:
               RELAY_DIR="$HOME/auth-relay"
               ;;
           esac
-          echo "RELAY_DIR=$RELAY_DIR"
-          echo "RELAY_DIR=$RELAY_DIR" >> "$GITHUB_ENV"
+          echo "Using RELAY_DIR=$RELAY_DIR"
 
-      - name: Clone or update the repo
-        if: ${{ inputs.install_location != 'existing' }}
-        env:
-          BRANCH: ${{ inputs.branch }}
-        run: |
-          set -e
-          if [[ -d "$RELAY_DIR/.git" ]]; then
-            echo "==> updating existing checkout at $RELAY_DIR"
-            cd "$RELAY_DIR"
-            git fetch --quiet origin "$BRANCH"
-            git checkout --quiet "$BRANCH"
-            git reset --hard "origin/$BRANCH"
-          else
-            echo "==> cloning into $RELAY_DIR (branch=$BRANCH)"
-            rm -rf "$RELAY_DIR"
-            git clone --quiet --branch "$BRANCH" \
-              https://github.com/parallelworks/auth-relay "$RELAY_DIR"
+          # ---- clone or update the repo (skipped for 'existing') ------
+          if [ "$INSTALL_LOCATION" != "existing" ]; then
+            if [ -d "$RELAY_DIR/.git" ]; then
+              echo "==> updating existing checkout at $RELAY_DIR"
+              cd "$RELAY_DIR"
+              git fetch --quiet origin "$BRANCH"
+              git checkout --quiet "$BRANCH"
+              git reset --hard "origin/$BRANCH"
+            else
+              echo "==> cloning into $RELAY_DIR (branch=$BRANCH)"
+              rm -rf "$RELAY_DIR"
+              git clone --quiet --branch "$BRANCH" \
+                https://github.com/parallelworks/auth-relay "$RELAY_DIR"
+            fi
+            ( cd "$RELAY_DIR" && echo "git head: $(git rev-parse --short HEAD)" )
           fi
-          (cd "$RELAY_DIR" && git rev-parse --short HEAD)
 
-      - name: Install portable Chrome (only if not already present)
-        if: ${{ inputs.install_location != 'existing' }}
-        run: |
-          set -e
+          # ---- install portable Chrome if no Chrome found anywhere ----
           CHROME_LOCAL="$RELAY_DIR/chrome-portable/opt/google/chrome/google-chrome"
-          if [[ -x "$CHROME_LOCAL" ]]; then
+          if [ -x "$CHROME_LOCAL" ]; then
             echo "Chrome already installed: $($CHROME_LOCAL --version)"
-          elif [[ -n "${PW_CHROME_BIN:-}" && -x "$PW_CHROME_BIN" ]]; then
+          elif [ -n "${PW_CHROME_BIN:-}" ] && [ -x "$PW_CHROME_BIN" ]; then
             echo "Using PW_CHROME_BIN=$PW_CHROME_BIN ($($PW_CHROME_BIN --version))"
           elif command -v google-chrome >/dev/null 2>&1; then
             echo "Using system google-chrome ($(google-chrome --version))"
@@ -179,23 +181,13 @@ jobs:
             bash "$RELAY_DIR/vdi/install-chrome.sh" "$RELAY_DIR"
           fi
 
-      - name: Run vdi/bootstrap.sh
-        run: |
-          set -e
+          # ---- VDI-side bootstrap (NMH, desktop icon, bookmarks, http) -
           bash "$RELAY_DIR/vdi/bootstrap.sh"
 
-      - name: Optionally clear bookmarks if user opted out
-        if: ${{ !inputs.seed_bookmarks }}
-        run: |
-          set -e
-          # bootstrap.sh always seeds bookmarks if the Chrome Bookmarks
-          # file doesn't already exist. If the operator unchecked the
-          # box, drop the seeded file so Chrome starts with none.
-          BM="$HOME/.config/google-chrome/Default/Bookmarks"
-          if [[ -f "$BM" ]]; then
-            # Only remove if it looks like our seeded set (contains the
-            # test page URL); never blow away a user's curated bookmarks.
-            if grep -q 'localhost:8080/test.html' "$BM" 2>/dev/null; then
+          # ---- clear seeded bookmarks if user opted out ---------------
+          if [ "$SEED_BOOKMARKS" != "true" ]; then
+            BM="$HOME/.config/google-chrome/Default/Bookmarks"
+            if [ -f "$BM" ] && grep -q 'localhost:8080/test.html' "$BM" 2>/dev/null; then
               rm -f "$BM"
               echo "removed seeded bookmarks (user opted out)"
             fi
@@ -205,44 +197,55 @@ jobs:
         if: ${{ inputs.auto_launch_chrome }}
         run: |
           set -e
+
+          # Re-resolve RELAY_DIR (see comment on the previous step).
+          case "$INSTALL_LOCATION" in
+            home) RELAY_DIR="$HOME/auth-relay" ;;
+            tmp)  RELAY_DIR="/tmp/$USER/auth-relay" ;;
+            existing)
+              if [ -n "$CUSTOM_DIR" ]; then RELAY_DIR="$CUSTOM_DIR"
+              else                          RELAY_DIR="$HOME/auth-relay"; fi ;;
+            *)    RELAY_DIR="$HOME/auth-relay" ;;
+          esac
+
           PY=""
           for cand in python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3; do
-            if command -v "$cand" >/dev/null 2>&1 \
-               && "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
-              PY="$(command -v "$cand")"
-              break
+            if command -v "$cand" >/dev/null 2>&1; then
+              if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
+                PY="$(command -v "$cand")"
+                break
+              fi
             fi
           done
-          if [[ -z "$PY" ]]; then
+          if [ -z "$PY" ]; then
             echo "ERROR: no Python >= 3.7 on PATH; cannot run install-extension.py" >&2
             exit 1
           fi
           echo "==> $PY $RELAY_DIR/vdi/install-extension.py"
-          "$PY" "$RELAY_DIR/vdi/install-extension.py" \
-              --ext-dir "$RELAY_DIR/vdi/extension" \
-              || {
-                rc=$?
-                echo "install-extension.py exited rc=$rc — see /tmp/pw-chrome-$USER.log if Chrome launched but failed"
-                exit "$rc"
-              }
+          set +e
+          "$PY" "$RELAY_DIR/vdi/install-extension.py" --ext-dir "$RELAY_DIR/vdi/extension"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "install-extension.py exited rc=$rc — see /tmp/pw-chrome-$USER.log if Chrome launched but failed"
+            exit "$rc"
+          fi
 
       - name: Print laptop-side next steps
         run: |
-          cat <<EOF
-
-          ============================================================
-           VDI-side bootstrap done. To finish from your LAPTOP:
-
-             git clone https://github.com/parallelworks/auth-relay
-             cd auth-relay
-             ./pwrelay setup            # one-time per laptop
-             ./pwrelay up <this-resource>   # each session
-
-           Then in the Chrome window that opened in your VDI:
-             - Open https://accounts.google.com / your SSO portal
-             - Touch your laptop YubiKey when prompted
-          ============================================================
-          EOF
+          echo ""
+          echo "============================================================"
+          echo " VDI-side bootstrap done. To finish from your LAPTOP:"
+          echo ""
+          echo "   git clone https://github.com/parallelworks/auth-relay"
+          echo "   cd auth-relay"
+          echo "   ./pwrelay setup            # one-time per laptop"
+          echo "   ./pwrelay up <this-resource>   # each session"
+          echo ""
+          echo " Then in the Chrome window that opened in your VDI:"
+          echo "   - Open https://accounts.google.com / your SSO portal"
+          echo "   - Touch your laptop YubiKey when prompted"
+          echo "============================================================"
 
   testpage_session:
     needs: [bootstrap]
