@@ -175,8 +175,12 @@ every case.
 
 ## CAC / smartcard / non-FIDO?
 
-Out of scope — see the bottom of `HANDOFF.md` for what a sibling
-project would look like.
+Out of scope for what currently ships. The repo name (`auth-relay`) is
+intentionally generic: a CAC/PIV (PKCS#11 + PC/SC) relay would slot in
+as a peer module — e.g., `pcsc/` sibling to `vdi/` — sharing the same
+`pwrelay` CLI and `pw ssh -R` tunnel pattern. The wire and the in-VDI
+hook would be different, but the architectural template carries over.
+See the bottom of `HANDOFF.md` for the design sketch.
 
 ## Iteration log
 
