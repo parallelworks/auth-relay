@@ -317,38 +317,37 @@ def main() -> int:
                   "Chrome will likely fail to open a window", file=sys.stderr)
     log_path = f"/tmp/pw-chrome-{os.environ.get('USER', 'user')}.log"
     log = open(log_path, "ab")
+    # We use pipe-based CDP (--remote-debugging-pipe) instead of the
+    # WebSocket-based port. The Extensions domain (specifically the
+    # Extensions.loadUnpacked method we depend on) is only exposed when
+    # Chrome speaks CDP over its inherited fd 3/4 pipes, not over a TCP
+    # socket. Chrome 148 returns 'Method not available' otherwise.
+    in_r, in_w = os.pipe()    # parent writes to in_w  -> Chrome reads from in_r as fd 3
+    out_r, out_w = os.pipe()  # parent reads from out_r <- Chrome writes to out_w as fd 4
+
     cmd = [
         chrome_bin,
-        # Chrome 148+ disables --remote-debugging-port unless
-        # --user-data-dir is also explicitly set ("DevTools remote
-        # debugging requires a non-default data directory" appears in
-        # the log otherwise). bootstrap.sh seeds the NMH manifest into
-        # this same dir's NativeMessagingHosts/ so Chrome finds it.
+        # Required: a non-default data dir or Chrome silently ignores
+        # debugging flags. The same dir holds the NMH manifest that
+        # bootstrap.sh writes.
         f"--user-data-dir={profile}",
-        # Suppress first-run UI gates that block CDP install on a fresh
-        # profile: the default-browser prompt, the welcome screen,
-        # (since Chrome ~122) the search-engine-choice modal, and the
-        # gnome-keyring / kwallet "create password" modal (caught on
-        # Rocky Linux 9 in the NOAA google-cluster VDI — Chrome's
-        # secret-service request silently stalled Extensions.loadUnpacked
-        # because the modal stole focus).
+        # Suppress first-run UI gates that block automation on a fresh
+        # profile: default-browser prompt, welcome screen, the
+        # search-engine-choice modal (Chrome 122+), and the
+        # gnome-keyring/kwallet 'create password' modal (Rocky Linux 9
+        # VDI on the google cluster).
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-default-apps",
         "--disable-search-engine-choice-screen",
         "--password-store=basic",
-        f"--remote-debugging-port={debug_port}",
-        "--remote-allow-origins=*",
-        # Required for Extensions.loadUnpacked over the WS-based debug
-        # port. Without it Chrome 148 replies 'Method not available' to
-        # the CDP call. The 'unsafe' is Chrome's name for "exposes
-        # extension debugging APIs to DevTools clients" — only matters
-        # for the short window our installer holds the debug port open.
+        # Pipe-based CDP (stdio rather than WebSocket). The Extensions
+        # domain is only available over this transport. Combined with
+        # --enable-unsafe-extension-debugging to unlock the method.
+        "--remote-debugging-pipe",
         "--enable-unsafe-extension-debugging",
-        # Land on chrome://extensions so the user sees the extension
-        # actually show up the moment install-extension.py finishes.
-        # Click "Inspect views: service worker" on that page to confirm
-        # `[pw-relay] attach() succeeded — proxy is active`.
+        # Initial tab so the user sees the extension show up right
+        # after install-extension.py completes.
         "chrome://extensions",
     ]
     # ulimit -Ss is shell-level; set RLIMIT_STACK in this process before exec.
@@ -360,6 +359,20 @@ def main() -> int:
             resource.setrlimit(resource.RLIMIT_STACK, (target, hard))
     except Exception as e:
         print(f"[install] could not clamp stack rlimit: {e}", file=sys.stderr)
+    # Chrome's pipe-based CDP expects fd 3 = stdin, fd 4 = stdout.
+    # We dup the read end of the in-pipe to fd 3 and the write end of
+    # the out-pipe to fd 4 in the child before exec.
+    def _child_setup() -> None:
+        os.dup2(in_r, 3)
+        os.dup2(out_w, 4)
+        # The pipe fds we passed live now (post-dup2 they remain open
+        # at 3/4); close the dup sources so we don't leak.
+        for fd in (in_r, in_w, out_r, out_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     proc = subprocess.Popen(
         cmd,
         stdout=log,
@@ -367,45 +380,67 @@ def main() -> int:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         env=env,
+        pass_fds=(in_r, out_w),
+        preexec_fn=_child_setup,
     )
+    # Parent only keeps the two ends it talks to Chrome through.
+    os.close(in_r)
+    os.close(out_w)
     print(f"[install] Chrome pid: {proc.pid} (log: {log_path})")
 
-    # Wait for the debug port to come up.
-    ws_url = None
-    for _ in range(120):
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{debug_port}/json/version", timeout=1
-            ) as r:
-                ws_url = json.loads(r.read())["webSocketDebuggerUrl"]
-                break
-        except Exception:
-            time.sleep(0.5)
-    if not ws_url:
-        print("[install] Chrome's debug port never came up", file=sys.stderr)
-        return 2
-    print(f"[install] CDP ws  : {ws_url}")
-
-    conn = ws_connect(ws_url)
-    msg = {
+    # Pipe-based CDP: JSON messages separated by NUL (\0) bytes.
+    # Send Extensions.loadUnpacked and wait for its reply.
+    request = json.dumps({
         "id": 1,
         "method": "Extensions.loadUnpacked",
         "params": {"path": str(ext_dir)},
-    }
-    conn.send_text(json.dumps(msg))
-    for _ in range(60):
-        resp = json.loads(conn.recv_text())
-        if resp.get("id") != 1:
-            continue
-        if "error" in resp:
-            err = resp["error"]
-            print(f"[install] CDP error: {err}", file=sys.stderr)
-            conn.close()
-            return 3
-        ext_id = resp.get("result", {}).get("id", "(no id returned)")
-        print(f"[install] installed extension id: {ext_id}")
-        break
-    conn.close()
+    }).encode() + b"\x00"
+    os.write(in_w, request)
+
+    # Read replies until we see one with id=1 or hit a timeout.
+    deadline = time.monotonic() + 60.0
+    buf = b""
+    installed_id = None
+    cdp_error = None
+    while time.monotonic() < deadline:
+        try:
+            chunk = os.read(out_r, 65536)
+        except OSError as e:
+            cdp_error = f"pipe read failed: {e}"
+            break
+        if not chunk:
+            cdp_error = "Chrome closed CDP pipe before replying"
+            break
+        buf += chunk
+        while True:
+            idx = buf.find(b"\x00")
+            if idx < 0:
+                break
+            line, buf = buf[:idx], buf[idx + 1:]
+            try:
+                msg = json.loads(line.decode("utf-8", errors="replace"))
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") != 1:
+                continue
+            if "error" in msg:
+                cdp_error = str(msg["error"])
+            else:
+                installed_id = msg.get("result", {}).get("id", "(no id returned)")
+            break
+        if installed_id is not None or cdp_error is not None:
+            break
+    if cdp_error is not None:
+        print(f"[install] CDP error: {cdp_error}", file=sys.stderr)
+        os.close(in_w); os.close(out_r)
+        return 3
+    if installed_id is None:
+        print("[install] CDP install timed out (no id=1 reply in 60s)", file=sys.stderr)
+        os.close(in_w); os.close(out_r)
+        return 4
+    print(f"[install] installed extension id: {installed_id}")
+    os.close(in_w)
+    os.close(out_r)
 
     if not args.keep_running:
         proc.terminate()
