@@ -134,6 +134,9 @@ EOF
       "$(sha256sum "$DESKTOP_FILE" | cut -d' ' -f1)" 2>/dev/null || true
     gio set "$DESKTOP_FILE" "metadata::trusted" true 2>/dev/null || true
   fi
+  # touch the Desktop dir so XFCE / nautilus re-scans and the new
+  # icon appears without the user having to right-click → Refresh.
+  touch "${HOME}/Desktop" 2>/dev/null || true
 fi
 
 # Background a local HTTP server for the test page (Singularity netns share
