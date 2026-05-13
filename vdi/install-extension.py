@@ -356,6 +356,16 @@ def main() -> int:
         # the proc crashes before the CDP handshake completes.
         "--disable-gpu",
         "--disable-software-rasterizer",
+        # --use-gl=swiftshader is the critical one on NOAA Ursa's
+        # TigerVNC, where the X server has no GLX extension at all.
+        # Without it, Chrome's --disable-gpu still tries to init GLX,
+        # fails ("ANGLE Display::initialize error 12289: GLX is not
+        # present"), the GPU process exits in a loop, and on this Chrome
+        # version that tears down the --remote-debugging-pipe with
+        # "Connection terminated while reading from pipe" before our
+        # CDP handshake completes. Forcing SwiftShader bypasses GLX
+        # entirely.
+        "--use-gl=swiftshader",
         "--disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer",
         # Cap renderer forks — Ursa's default ulimit -u is 1024 and
         # Chrome easily blows past that when left uncapped.
