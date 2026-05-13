@@ -66,22 +66,61 @@ mkdir -p "$PW_CHROME_USER_DATA_DIR" 2>/dev/null || true
 # is at /tmp/pw-chrome.log if you need to inspect it.
 LOG="${PW_CHROME_LOG:-/tmp/pw-chrome-$(id -un).log}"
 
-# If DISPLAY isn't set (e.g., we were invoked from a pw ssh shell with no
-# X forwarding), discover the user's running VNC server's display + auth
-# file. Lets `pw ssh resource '~/auth-relay/vdi/bin/chrome &'` Just Work
-# from a laptop terminal — Chrome pops into the VDI desktop the user
-# already has open.
+# Discover the user's running VNC server's display + auth file unless
+# DISPLAY is already set. Lets `pw ssh resource '~/auth-relay/vdi/bin/chrome &'`
+# Just Work from a laptop terminal — Chrome pops into the VDI desktop
+# the user already has open.
+#
+# Selection order, first match wins:
+#   1. $PW_VDI_DISPLAY (user override, e.g. ":5") — pair with
+#      ~/.vnc/xauth-<N> for the matching auth file.
+#   2. The VNC session whose rfb socket has the MOST active client
+#      connections. ACTIVATE-style sessions go stale once the user
+#      closes the browser tab, leaving the X server running with zero
+#      viewers. Picking the one with active connections finds the
+#      desktop the user is actually looking at.
+#   3. The most-recently-started VNC (highest PID heuristic) — fallback
+#      when no rfb sockets are readable.
 if [[ -z "${DISPLAY:-}" ]]; then
-  vnc_argv=$(ps -u "$(whoami)" -o args= 2>/dev/null \
-              | grep -E '/(Xvnc|Xkasmvnc|Xtigervnc|Xvfb)( |$)' \
-              | head -1)
-  if [[ -n "$vnc_argv" ]]; then
-    disp=$(printf ' %s ' "$vnc_argv" | grep -oE ' :[0-9]+ ' | head -1 | tr -d ' ')
-    xauth=$(printf '%s' "$vnc_argv" | sed -nE 's/.*-auth +([^ ]+).*/\1/p' | head -1)
-    if [[ -n "$disp" ]]; then
-      export DISPLAY="$disp"
-      [[ -n "$xauth" ]] && export XAUTHORITY="$xauth"
-      echo "[chrome] auto-detected VDI: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-(none)}" >&2
+  if [[ -n "${PW_VDI_DISPLAY:-}" ]]; then
+    export DISPLAY="$PW_VDI_DISPLAY"
+    n="${PW_VDI_DISPLAY#:}"
+    if [[ -f "$HOME/.vnc/xauth-$n" ]]; then
+      export XAUTHORITY="$HOME/.vnc/xauth-$n"
+    fi
+    echo "[chrome] using PW_VDI_DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-(none)}" >&2
+  else
+    # Build candidate list: lines of "<display> <xauth>" for each
+    # running Xvnc-family server. Then pick the best one.
+    candidates=""
+    while IFS= read -r argv; do
+      [[ -z "$argv" ]] && continue
+      disp=$(printf ' %s ' "$argv" | grep -oE ' :[0-9]+ ' | head -1 | tr -d ' ')
+      xauth=$(printf '%s' "$argv" | sed -nE 's/.*-auth +([^ ]+).*/\1/p' | head -1)
+      [[ -z "$disp" ]] && continue
+      candidates+="$disp $xauth"$'\n'
+    done < <(ps -u "$(whoami)" -o args= 2>/dev/null \
+              | grep -E '/(Xvnc|Xkasmvnc|Xtigervnc|Xvfb)( |$)')
+
+    best_disp="" ; best_xauth="" ; best_conns=-1
+    while IFS=' ' read -r disp xauth; do
+      [[ -z "$disp" ]] && continue
+      n="${disp#:}"
+      conns=0
+      sock="$HOME/.vnc/pw-rfb-$n.sock"
+      if [[ -S "$sock" ]]; then
+        conns=$(ss -xan 2>/dev/null | grep -c "$sock" || echo 0)
+      fi
+      if (( conns > best_conns )); then
+        best_disp="$disp"; best_xauth="$xauth"; best_conns=$conns
+      fi
+    done <<< "$candidates"
+
+    if [[ -n "$best_disp" ]]; then
+      export DISPLAY="$best_disp"
+      [[ -n "$best_xauth" ]] && export XAUTHORITY="$best_xauth"
+      echo "[chrome] auto-detected VDI: DISPLAY=$DISPLAY XAUTHORITY=${XAUTHORITY:-(none)} (active connections: $best_conns)" >&2
+      echo "[chrome] override with PW_VDI_DISPLAY=:N if this is the wrong session" >&2
     fi
   fi
 fi
