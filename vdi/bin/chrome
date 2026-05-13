@@ -132,6 +132,18 @@ ulimit -Sn "$_hardn" 2>/dev/null || true
 #                                       decoder accel, viz display compositor
 #   --renderer-process-limit=4          cap renderer forks; relevant on
 #                                       Ursa where ulimit -u was 1024
+#   --use-gl=swiftshader                force software OpenGL via SwiftShader.
+#                                       Mandatory on VNC servers that don't
+#                                       expose the GLX X11 extension at all
+#                                       (NOAA Ursa's TigerVNC). Without this,
+#                                       `--disable-gpu` only disables
+#                                       acceleration — Chrome still tries to
+#                                       initialize GLX, fails ("ANGLE
+#                                       Display::initialize error 12289: GLX
+#                                       is not present"), and the GPU process
+#                                       exits in a loop, which has been seen
+#                                       to tear down the DevTools pipe used
+#                                       by install-extension.py.
 exec "$CHROME" \
     --user-data-dir="$PW_CHROME_USER_DATA_DIR" \
     --no-first-run \
@@ -141,6 +153,7 @@ exec "$CHROME" \
     --password-store=basic \
     --disable-gpu \
     --disable-software-rasterizer \
+    --use-gl=swiftshader \
     --disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer \
     --renderer-process-limit=4 \
     "$@" </dev/null >>"$LOG" 2>&1
