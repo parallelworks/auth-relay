@@ -60,28 +60,52 @@ fi
 say "using OpenSC PKCS#11 module: $OPENSC_MOD"
 
 # ---- start p11-kit server -------------------------------------------------
+#
+# p11-kit server picks its socket path itself (under XDG_RUNTIME_DIR by
+# default, or under --socket-base) and prints it on stdout as
+#   P11_KIT_SERVER_ADDRESS=unix:path=/the/actual/path;
+# We capture that line and use the path it announces — don't try to
+# hardcode/guess the path.
 
-SOCKET_DIR="${TMPDIR:-/tmp}/pwrelay-cac-$$"
-mkdir -p "$SOCKET_DIR"
-trap 'rm -rf "$SOCKET_DIR"; jobs -p | xargs -r kill 2>/dev/null' EXIT INT TERM
-SOCKET="$SOCKET_DIR/p11.sock"
+WORK_DIR="${TMPDIR:-/tmp}/pwrelay-cac-$$"
+mkdir -p "$WORK_DIR"
+STDOUT_FILE="$WORK_DIR/server.out"
+trap 'rm -rf "$WORK_DIR"; jobs -p | xargs -r kill 2>/dev/null' EXIT INT TERM
 
-say "starting p11-kit server on Unix socket: $SOCKET"
-p11-kit server --provider "$OPENSC_MOD" --name pwrelay-cac &
+say "starting p11-kit server (socket-base: $WORK_DIR)"
+# --foreground keeps it attached so $! is the actual server PID (without
+# this flag p11-kit daemonizes and outlives the script).
+p11-kit server \
+    --foreground \
+    --name pwrelay-cac \
+    --socket-base "$WORK_DIR" \
+    --provider "$OPENSC_MOD" \
+    "pkcs11:" \
+    > "$STDOUT_FILE" 2>&1 &
 P11_PID=$!
-# p11-kit server prints "P11_KIT_SERVER_ADDRESS=..." on its stdout; the
-# Unix socket path is inside that env var. Wait for the server to be
-# ready by probing.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if [[ -S "$SOCKET" ]]; then break; fi
-  sleep 0.3
+
+SOCKET=""
+for _ in $(seq 1 50); do  # up to ~10s
+  if grep -q '^P11_KIT_SERVER_ADDRESS=' "$STDOUT_FILE" 2>/dev/null; then
+    SOCKET=$(grep -m1 '^P11_KIT_SERVER_ADDRESS=' "$STDOUT_FILE" \
+              | sed -E 's|^P11_KIT_SERVER_ADDRESS=unix:path=([^;]+);?.*|\1|')
+    [[ -S "$SOCKET" ]] && break
+  fi
+  if ! kill -0 "$P11_PID" 2>/dev/null; then
+    err "p11-kit server exited early. Output:"
+    sed 's/^/  /' "$STDOUT_FILE" >&2
+    exit 1
+  fi
+  sleep 0.2
 done
-if [[ ! -S "$SOCKET" ]]; then
-  err "p11-kit server didn't create $SOCKET in 3s"
+
+if [[ -z "$SOCKET" || ! -S "$SOCKET" ]]; then
+  err "p11-kit server didn't print P11_KIT_SERVER_ADDRESS in ~10s. Output:"
+  sed 's/^/  /' "$STDOUT_FILE" >&2
   kill "$P11_PID" 2>/dev/null || true
   exit 1
 fi
-say "p11-kit server up (pid $P11_PID)"
+say "p11-kit server up (pid $P11_PID); socket: $SOCKET"
 
 # ---- bridge to TCP --------------------------------------------------------
 
@@ -90,5 +114,6 @@ socat TCP-LISTEN:"$PORT",bind=127.0.0.1,reuseaddr,fork UNIX-CONNECT:"$SOCKET" &
 SOCAT_PID=$!
 say "socat bridge up (pid $SOCAT_PID)"
 say "agent ready — point a pw ssh -R $PORT:127.0.0.1:$PORT at this laptop"
+say "(this terminal stays attached; Ctrl+C to stop. pwrelay up --cac spawns this for you.)"
 
 wait $P11_PID $SOCAT_PID
