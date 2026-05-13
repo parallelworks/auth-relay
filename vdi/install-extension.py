@@ -361,12 +361,15 @@ def main() -> int:
         print(f"[install] could not clamp stack rlimit: {e}", file=sys.stderr)
     # Chrome's pipe-based CDP expects fd 3 = stdin, fd 4 = stdout.
     # We dup the read end of the in-pipe to fd 3 and the write end of
-    # the out-pipe to fd 4 in the child before exec.
+    # the out-pipe to fd 4 in the child before exec. We have to list
+    # both 3 and 4 in pass_fds — subprocess's close-fds loop runs
+    # AFTER preexec_fn, and without 3/4 in the keep-list it'd close
+    # the descriptors we just dup'd. (Chrome's complaint without this:
+    # 'Remote debugging pipe file descriptors are not open'.)
     def _child_setup() -> None:
         os.dup2(in_r, 3)
         os.dup2(out_w, 4)
-        # The pipe fds we passed live now (post-dup2 they remain open
-        # at 3/4); close the dup sources so we don't leak.
+        # Drop the original pipe fds; only 3/4 should survive into exec.
         for fd in (in_r, in_w, out_r, out_w):
             try:
                 os.close(fd)
@@ -380,7 +383,7 @@ def main() -> int:
         stdin=subprocess.DEVNULL,
         start_new_session=True,
         env=env,
-        pass_fds=(in_r, out_w),
+        pass_fds=(3, 4, in_r, out_w),
         preexec_fn=_child_setup,
     )
     # Parent only keeps the two ends it talks to Chrome through.
