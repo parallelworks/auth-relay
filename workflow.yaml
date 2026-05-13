@@ -229,6 +229,23 @@ jobs:
             exit "$rc"
           fi
 
+          # install-extension.py uses --remote-debugging-pipe which makes
+          # Chrome exit when its CDP pipe closes (i.e., as soon as
+          # install-extension.py returns). The extension IS persisted in
+          # the user-data-dir so it auto-loads on the next launch.
+          #
+          # Now spawn a *persistent* Chrome via the wrapper (no debug
+          # pipe), detached so it survives the workflow runner exiting.
+          # The extension auto-loads from Preferences and the user sees
+          # a Chrome window in their VDI desktop with everything wired.
+          echo "==> launching persistent Chrome via wrapper"
+          setsid nohup "$RELAY_DIR/vdi/bin/chrome" chrome://extensions \
+            </dev/null >>"/tmp/pw-chrome-$USER.log" 2>&1 &
+          disown
+          # Give it a moment to spin up and report visible procs.
+          sleep 3
+          pgrep -afu "$USER" "chrome-portable/opt/google/chrome/chrome\$" | head -2 || true
+
       - name: Print laptop-side next steps
         run: |
           echo ""
