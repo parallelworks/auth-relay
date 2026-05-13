@@ -89,6 +89,17 @@ on:
           Run vdi/install-extension.py after bootstrap. Will auto-detect
           your running Xvnc/Xkasmvnc and pop Chrome into that display.
           Disable if you only want the NMH and Desktop launcher staged.
+      enable_cac:
+        type: boolean
+        label: Also register CAC / PIV smartcard relay (beta)
+        default: false
+        tooltip: |
+          Runs pcsc/bootstrap.sh on the remote — registers a PKCS#11
+          forwarding module with NSS so Chrome can use the CAC plugged
+          into your laptop for TLS client-cert auth (sso.noaa.gov,
+          etc.). Pair with `./pwrelay up <resource> --cac` on your
+          laptop. Requires p11-kit + socat + opensc on the remote;
+          the bootstrap script will tell you if anything is missing.
 
 jobs:
   bootstrap:
@@ -99,6 +110,7 @@ jobs:
       CUSTOM_DIR: ${{ inputs.custom_relay_dir }}
       BRANCH: ${{ inputs.branch }}
       SEED_BOOKMARKS: ${{ inputs.seed_bookmarks }}
+      ENABLE_CAC: ${{ inputs.enable_cac }}
     steps:
       # ACTIVATE doesn't expose $GITHUB_ENV for cross-step variable
       # sharing the way GitHub Actions does, so each step that needs
@@ -175,6 +187,12 @@ jobs:
               rm -f "$BM"
               echo "removed seeded bookmarks (user opted out)"
             fi
+          fi
+
+          # ---- (optional) register CAC/PIV PKCS#11 module with NSS ----
+          if [ "$ENABLE_CAC" = "true" ]; then
+            echo "==> registering CAC/PIV relay module with NSS"
+            bash "$RELAY_DIR/pcsc/bootstrap.sh"
           fi
 
       - name: Auto-launch Chrome + load extension
