@@ -1,0 +1,9 @@
+[
+  { "name": "Test page (relay)",  "url": "http://localhost:8080/test.html" },
+  { "name": "Gmail",              "url": "https://mail.google.com/" },
+  { "name": "Google Drive",       "url": "https://drive.google.com/" },
+  { "name": "NOAA RDHPCS Git",    "url": "https://git.rdhpcs.noaa.gov/" },
+  { "name": "NOAA RDHPCS AIM",    "url": "https://aim.rdhpcs.noaa.gov/" },
+  { "name": "NOAA SSO",           "url": "https://sso.noaa.gov/" },
+  { "name": "Parallel Works",     "url": "https://parallelworks.com/" }
+]

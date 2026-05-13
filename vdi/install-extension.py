@@ -32,22 +32,45 @@ script will refuse to start a competing instance (one --user-data-dir
 gets exclusive access). Close that Chrome window first.
 """
 
-from __future__ import annotations
+# Re-exec under a newer Python if /usr/bin/python3 is too old (RHEL 8/9
+# typically ships 3.6 as system /usr/bin/python3, but has python3.12 in
+# /usr/bin too). This block uses only stdlib that exists since Python 2,
+# so it parses successfully regardless of which Python ran us.
+import os
+import sys
+if sys.version_info < (3, 7):
+    for _cand in ("python3.12", "python3.11", "python3.10",
+                  "python3.9", "python3.8", "python3.7"):
+        for _d in os.environ.get("PATH", "").split(os.pathsep):
+            _p = os.path.join(_d, _cand)
+            if os.access(_p, os.X_OK):
+                os.execv(_p, [_p] + sys.argv)
+    sys.stderr.write(
+        "install-extension.py needs Python 3.7+; the python3 you invoked "
+        "is %s and no python3.7-3.12 was on PATH. Re-run as e.g.\n"
+        "    python3.12 %s\n" % (sys.version.split()[0], " ".join(sys.argv))
+    )
+    sys.exit(2)
 
+# NOTE: no `from __future__ import annotations` here. Future imports must
+# be the first statement in a file (after the docstring), but we run a
+# Python-version-check + re-exec block before any imports — that block
+# can't follow a future import. So this script is written to be
+# annotation-compatible with Python 3.7+ without futures (Optional from
+# typing instead of X | None, etc.).
 import argparse
 import base64
 import json
-import os
 import secrets
 import shutil
 import socket
 import struct
 import subprocess
-import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Optional
 
 
 def find_chrome() -> str:
@@ -85,6 +108,41 @@ def seed_dev_mode(profile_dir: Path) -> None:
     prefs.setdefault("extensions", {}).setdefault("ui", {})["developer_mode"] = True
     pref_path.write_text(json.dumps(prefs, indent=2))
     print(f"[install] developer_mode=true seeded in {pref_path}")
+
+
+def autodetect_vnc() -> "Optional[tuple]":
+    """Find the user's running VNC server and return (DISPLAY, XAUTHORITY).
+
+    This lets `pw ssh resource 'python3 install-extension.py'` from a
+    laptop terminal pop Chrome into the user's already-running VDI
+    desktop, instead of failing because DISPLAY isn't set in the ssh
+    shell. Matches Xvnc / Xkasmvnc / Xtigervnc (TigerVNC uses 'Xvnc',
+    KasmVNC uses 'Xkasmvnc'; both put the display number and the auth
+    file path in argv).
+    """
+    import re
+    import subprocess
+    try:
+        user = os.environ.get("USER") or subprocess.check_output(["id", "-un"]).decode().strip()
+        out = subprocess.check_output(
+            ["ps", "-u", user, "-o", "args="], text=True, timeout=5
+        )
+    except Exception:
+        return None
+    for line in out.splitlines():
+        argv = line.strip()
+        # Match the Xvnc-family server's full argv line.
+        if not re.search(r"/(Xvnc|Xkasmvnc|Xtigervnc|Xvfb)\b", argv):
+            continue
+        # Display number: a `:N` token surrounded by spaces or end-of-line.
+        m = re.search(r"(?:^|\s)(:\d+)(?:\s|$)", argv)
+        if not m:
+            continue
+        display = m.group(1)
+        a = re.search(r"-auth\s+(\S+)", argv)
+        xauthority = a.group(1) if a else ""
+        return (display, xauthority)
+    return None
 
 
 def pick_unused_port() -> int:
@@ -233,14 +291,33 @@ def main() -> int:
     # (see vdi/bin/chrome). The default profile dir is the one we just seeded.
     # We also clamp the stack ulimit on HPC nodes (see comment in vdi/bin/chrome).
     env = os.environ.copy()
-    env.setdefault("DISPLAY", os.environ.get("DISPLAY", ":1"))
+    # If DISPLAY isn't already set (e.g., we were invoked from a pw ssh
+    # shell with no X forwarding), find the user's running VNC server
+    # and use its display + auth. Lets `pw ssh resource 'python3
+    # install-extension.py'` Just Work from a laptop terminal.
+    if not env.get("DISPLAY"):
+        detected = autodetect_vnc()
+        if detected:
+            disp, xauth = detected
+            env["DISPLAY"] = disp
+            if xauth:
+                env["XAUTHORITY"] = xauth
+            print(f"[install] auto-detected VDI session: DISPLAY={disp}"
+                  + (f" XAUTHORITY={xauth}" if xauth else ""))
+        else:
+            print("[install] WARNING: no DISPLAY in env and no running VNC found; "
+                  "Chrome will likely fail to open a window", file=sys.stderr)
     log_path = f"/tmp/pw-chrome-{os.environ.get('USER', 'user')}.log"
     log = open(log_path, "ab")
     cmd = [
         chrome_bin,
         f"--remote-debugging-port={debug_port}",
         "--remote-allow-origins=*",
-        "about:blank",
+        # Land on chrome://extensions so the user sees the extension
+        # actually show up the moment install-extension.py finishes.
+        # Click "Inspect views: service worker" on that page to confirm
+        # `[pw-relay] attach() succeeded — proxy is active`.
+        "chrome://extensions",
     ]
     # ulimit -Ss is shell-level; set RLIMIT_STACK in this process before exec.
     try:
