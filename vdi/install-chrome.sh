@@ -2,7 +2,7 @@
 # Install a portable Google Chrome under a user-chosen prefix. No root,
 # no rpm install — just rpm2cpio + cpio.
 #
-# Suggested install patterns on NOAA on-prem HPC:
+# Suggested install pattern on HPC clusters with tight per-user $HOME quotas:
 #
 #   # Once, by a project admin, into the shared contrib filesystem so
 #   # users don't burn their personal $HOME quota:

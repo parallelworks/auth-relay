@@ -189,8 +189,8 @@ cmd_up() {
   ok "agent listening on 127.0.0.1:${chosen_port}"
 
   # Tunnel — wrapped in a supervisor loop so the connection respawns if the
-  # cluster drops the session (NOAA Gaea has been seen to idle-timeout after
-  # roughly an hour even with ServerAliveInterval set). The supervisor itself
+  # cluster drops the session (some HPC clusters idle-time-out after about
+  # an hour even with ServerAliveInterval set). The supervisor itself
   # is what we put in PID_TUNNEL; killing it exits the loop cleanly.
   # The remote bash uses `exec -a` to rename the sleep process so cmd_down
   # can pkill *only our* keepalive without touching anyone else's.
@@ -205,7 +205,7 @@ cmd_up() {
           -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes \
           -R "${chosen_port}:127.0.0.1:${chosen_port}" \
           "${rs_user}@${resource}" \
-          "echo '[remote] tunnel-up on \$(hostname); pid=\$\$ marker=${session_id}'; exec -a '${session_id}' sleep 86400"
+          "echo \"[remote] tunnel-up on \$(hostname); pid=\$\$ marker=${session_id}\"; exec -a \"${session_id}\" sleep 86400"
       rc=$?
       if grep -qE "Permission denied|remote port forwarding failed" "$LOG_TUNNEL" 2>/dev/null; then
         echo "[supervisor] terminal failure (rc=$rc); not retrying" >>"$LOG_TUNNEL"

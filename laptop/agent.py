@@ -20,7 +20,7 @@ Run on the laptop:
 Then have a peer reach it through the tunnel:
 
     ssh -i ~/.ssh/pwcli -o ProxyCommand="pw ssh --proxy-command %h" \\
-        -R 7777:127.0.0.1:7777 Matthew.Shaxted@<resource> '<run client>'
+        -R 7777:127.0.0.1:7777 <user>@<resource> '<run client>'
 """
 
 from __future__ import annotations
