@@ -324,6 +324,11 @@ def main() -> int:
     # socket. Chrome 148 returns 'Method not available' otherwise.
     in_r, in_w = os.pipe()    # parent writes to in_w  -> Chrome reads from in_r as fd 3
     out_r, out_w = os.pipe()  # parent reads from out_r <- Chrome writes to out_w as fd 4
+    # Python 3.4+ sets FD_CLOEXEC on os.pipe() fds by default — they
+    # would be auto-closed on exec, leaving Chrome with nothing to read
+    # from. Mark the ones the child needs as inheritable.
+    os.set_inheritable(in_r, True)
+    os.set_inheritable(out_w, True)
 
     cmd = [
         chrome_bin,
@@ -367,8 +372,14 @@ def main() -> int:
     # the descriptors we just dup'd. (Chrome's complaint without this:
     # 'Remote debugging pipe file descriptors are not open'.)
     def _child_setup() -> None:
-        os.dup2(in_r, 3)
-        os.dup2(out_w, 4)
+        # dup2(inheritable=True) is the Python 3 default and produces
+        # fd 3 / fd 4 with FD_CLOEXEC CLEARED, so they survive exec.
+        # We still re-assert via set_inheritable to be defensive against
+        # libc / glibc layers that may flip CLOEXEC back on.
+        os.dup2(in_r, 3, inheritable=True)
+        os.dup2(out_w, 4, inheritable=True)
+        os.set_inheritable(3, True)
+        os.set_inheritable(4, True)
         # Drop the original pipe fds; only 3/4 should survive into exec.
         for fd in (in_r, in_w, out_r, out_w):
             try:
