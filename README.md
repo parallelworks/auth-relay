@@ -47,4 +47,5 @@ desktop icon.
 | [Troubleshooting](docs/troubleshooting.md) | When something doesn't work |
 | [HPC deployment](docs/hpc.md) | Shared install for clusters with tight `$HOME` quota |
 | [Customization](docs/customization.md) | Bookmarks, extension key, per-org branding |
+| [CAC / PIV relay (design)](docs/cac-relay-design.md) | Planned smartcard relay alongside FIDO2 |
 | [HANDOFF.md](HANDOFF.md) | Design log + per-iteration history |
