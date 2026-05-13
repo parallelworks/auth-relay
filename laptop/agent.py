@@ -37,11 +37,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.protocol import recv_frame, send_frame
 
+from fido2.ctap import CtapError
 from fido2.hid import CTAPHID, CtapHidDevice
 
 LOG = logging.getLogger("agent")
 
 LOOPBACK_HOST = "127.0.0.1"
+
+# CTAP1_ERR_OTHER — when the failure isn't from the authenticator itself
+# (e.g., HID transport went sideways), we return this generic status so the
+# peer gets a parseable CTAP error byte rather than a dead socket.
+CTAP_ERR_OTHER = 0x7F
 
 
 def discover_yubikey() -> CtapHidDevice:
@@ -53,7 +59,59 @@ def discover_yubikey() -> CtapHidDevice:
     return devs[0]
 
 
-def serve_one(client: socket.socket, addr: tuple, device: CtapHidDevice, device_lock: threading.Lock) -> None:
+class DeviceManager:
+    """Wraps a CtapHidDevice and transparently re-opens it on transport
+    failures (HID stale channel, USB blip, etc.). Concurrent callers
+    serialize via the same lock; only one ceremony can be in flight at a
+    time on a YubiKey.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._device: CtapHidDevice | None = None
+
+    def _ensure_open(self) -> CtapHidDevice:
+        if self._device is None:
+            self._device = discover_yubikey()
+            LOG.info("device opened: %s", self._device.descriptor)
+        return self._device
+
+    def _force_reopen(self) -> None:
+        if self._device is not None:
+            try:
+                self._device.close()
+            except Exception:
+                pass
+            self._device = None
+        # Brief pause lets the OS release the HID handle before we re-open.
+        time.sleep(0.2)
+
+    def call_cbor(self, frame: bytes) -> bytes:
+        """Send a CTAPHID CBOR frame, return the response bytes.
+
+        On transport-level failures (typically `ConnectionFailure: Wrong
+        channel` after the key has been touched-while-idle, replugged, or
+        used by another app), re-open the HID device and retry once.
+        Authenticator-level errors (`CtapError`, non-zero CBOR status) are
+        propagated unchanged so the wire carries the real status byte.
+        """
+        with self._lock:
+            dev = self._ensure_open()
+            try:
+                return dev.call(CTAPHID.CBOR, frame)
+            except CtapError:
+                # Authenticator returned a non-zero status; that's a real
+                # CTAP-level error, not a transport problem. Re-raise so the
+                # caller forwards the actual code.
+                raise
+            except Exception as exc:
+                LOG.warning("device.call transport failure (%r); re-opening", exc)
+                self._force_reopen()
+                dev = self._ensure_open()
+                return dev.call(CTAPHID.CBOR, frame)
+
+
+def serve_one(client: socket.socket, addr: tuple, devices: DeviceManager) -> None:
     peer = f"{addr[0]}:{addr[1]}"
     LOG.info("connection from %s", peer)
     try:
@@ -68,18 +126,18 @@ def serve_one(client: socket.socket, addr: tuple, device: CtapHidDevice, device_
                     continue
                 ctap2_cmd = frame[0]
                 t0 = time.perf_counter()
-                # Serialize device access; the YubiKey can only handle one
-                # ceremony at a time, and CTAPHID is not multi-channel safe
-                # for our purposes.
-                with device_lock:
-                    LOG.info("%s -> ctap2_cmd=0x%02x len=%d", peer, ctap2_cmd, len(frame))
-                    try:
-                        response = device.call(CTAPHID.CBOR, frame)
-                    except Exception as exc:
-                        LOG.error("%s device.call failed: %r", peer, exc)
-                        # Send a CTAP error frame back: status 0x7F (CTAP1_ERR_OTHER)
-                        # so the peer gets a parseable response rather than a dead socket.
-                        response = b"\x7f"
+                LOG.info("%s -> ctap2_cmd=0x%02x len=%d", peer, ctap2_cmd, len(frame))
+                try:
+                    response = devices.call_cbor(frame)
+                except CtapError as exc:
+                    # Authenticator-level error — forward the real status
+                    # byte so the extension/RP sees what the device said
+                    # (e.g., 0x2E = NO_CREDENTIALS, 0x36 = USER_ACTION_TIMEOUT).
+                    response = bytes([exc.code])
+                    LOG.warning("%s ctap error 0x%02x: %s", peer, exc.code, exc)
+                except Exception as exc:
+                    LOG.error("%s device.call hard failure: %r", peer, exc)
+                    response = bytes([CTAP_ERR_OTHER])
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 status = response[0] if response else 0xFF
                 LOG.info("%s <- status=0x%02x len=%d dt=%.1fms", peer, status, len(response), dt_ms)
@@ -97,9 +155,9 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    device = discover_yubikey()
-    LOG.info("YubiKey discovered: %s", device.descriptor)
-    device_lock = threading.Lock()
+    devices = DeviceManager()
+    # Open eagerly so the user sees the YubiKey is detected at startup.
+    devices._ensure_open()  # noqa: SLF001 — internal use, fine here
 
     # Intentionally loopback-only. The only sanctioned path from a remote PW
     # session to this agent is the pw ssh -R reverse tunnel, which terminates
@@ -114,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             client, addr = srv.accept()
             threading.Thread(
-                target=serve_one, args=(client, addr, device, device_lock), daemon=True
+                target=serve_one, args=(client, addr, devices), daemon=True
             ).start()
     except KeyboardInterrupt:
         LOG.info("shutting down")

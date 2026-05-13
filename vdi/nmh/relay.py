@@ -35,8 +35,30 @@ import traceback
 from typing import Any
 
 RELAY_HOST = os.environ.get("PW_RELAY_HOST", "127.0.0.1")
-RELAY_PORT = int(os.environ.get("PW_RELAY_PORT", "7777"))
 RELAY_FRAME_MAX = 1 << 20
+
+# A pwrelay session may end up on a non-default port if 7777 was taken by
+# leftover pw-agent forward state from a prior session (see iter-6 notes
+# in README). Pwrelay drops the chosen port into this file when it brings
+# the tunnel up. NMH reads it on each frame so reconnects always pick
+# the live port, even if it changed between Chrome's NMH spawns.
+_PORT_HINT_FILE = f"/tmp/pw-relay-port-{os.environ.get('USER', 'user')}"
+
+
+def _read_port_hint() -> int:
+    try:
+        with open(_PORT_HINT_FILE) as f:
+            return int(f.read().strip())
+    except Exception:
+        return int(os.environ.get("PW_RELAY_PORT", "7777"))
+
+
+# Read-deadline for relay socket. Touch ceremonies can legitimately take
+# 30+ seconds (user has to physically touch the key), so we set this
+# above that bound. If we hit it, the tunnel is almost certainly broken;
+# we surface a clean error to Chrome instead of hanging the WebAuthn
+# request forever (today's "request already pending" trap).
+RECV_TIMEOUT_S = float(os.environ.get("PW_RELAY_RECV_TIMEOUT", "90"))
 
 
 def log(msg: str) -> None:
@@ -89,7 +111,8 @@ def relay_call(sock: socket.socket, frame: bytes) -> bytes:
 
 
 def main() -> int:
-    log(f"starting; relay={RELAY_HOST}:{RELAY_PORT}")
+    port = _read_port_hint()
+    log(f"starting; relay={RELAY_HOST}:{port}  recv_timeout={RECV_TIMEOUT_S:.0f}s")
     sock: socket.socket | None = None
     try:
         while True:
@@ -119,9 +142,13 @@ def main() -> int:
                 padded = frame_b64 + "=" * (-len(frame_b64) % 4)
                 frame = base64.urlsafe_b64decode(padded)
                 if sock is None:
-                    sock = socket.create_connection((RELAY_HOST, RELAY_PORT), timeout=10)
-                    sock.settimeout(None)  # block on touch waits
-                    log(f"connected to relay (local={sock.getsockname()})")
+                    # Re-read the port hint on each (re)connect so a pwrelay
+                    # session that switched ports mid-life is picked up
+                    # transparently.
+                    port = _read_port_hint()
+                    sock = socket.create_connection((RELAY_HOST, port), timeout=10)
+                    sock.settimeout(RECV_TIMEOUT_S)
+                    log(f"connected to relay (local={sock.getsockname()} port={port})")
                 resp = relay_call(sock, frame)
                 write_chrome_message({"id": req_id, "ok": True, "frame": base64.b64encode(resp).decode("ascii")})
             except Exception as e:

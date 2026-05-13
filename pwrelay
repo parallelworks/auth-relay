@@ -8,12 +8,17 @@
 #   ./pwrelay setup                    one-time: deps + venv + key check
 #   ./pwrelay up <resource>            start agent + tunnel; stays foreground
 #   ./pwrelay status                   show what (if anything) is running
-#   ./pwrelay down                     stop any running agent/tunnel
+#   ./pwrelay down                     stop our agent/tunnel; tell remote
+#                                      to drop our tunnel keepalive too
+#   ./pwrelay doctor [<resource>]      print local + remote state for diag
+#   ./pwrelay reset  [<resource>]      kill everything *we own* on both ends
+#                                      (never touches pw agent)
 #
 # Examples:
 #   ./pwrelay up workspace
-#   ./pwrelay up gclusternoaav3
-#   ./pwrelay up pw://Matthew.Shaxted/gclusternoaav3
+#   ./pwrelay up gaeac5
+#   ./pwrelay doctor gaeac5            when something looks stuck
+#   ./pwrelay reset  gaeac5            nuclear cleanup, both ends
 
 set -euo pipefail
 
@@ -22,6 +27,9 @@ VENV="$HERE/.venv"
 PORT="${PW_RELAY_PORT:-7777}"
 PID_AGENT="/tmp/pwrelay-agent.pid"
 PID_TUNNEL="/tmp/pwrelay-tunnel.pid"
+PID_PORT="/tmp/pwrelay-port"        # chosen port this session
+PID_SESSION="/tmp/pwrelay-session"  # unique session-id marker for remote pkill
+PID_RESOURCE="/tmp/pwrelay-resource"
 LOG_AGENT="/tmp/pwrelay-agent.log"
 LOG_TUNNEL="/tmp/pwrelay-tunnel.log"
 
@@ -133,9 +141,44 @@ cmd_up() {
     exit 1
   fi
 
+  # Pick an unused port for this session. Start at PORT (default 7777) and
+  # walk up to PORT+7. The pw-agent on the cluster caches forward state
+  # across sessions — if a prior pwrelay's forward isn't fully released
+  # we just use the next port instead of fighting for the same one.
+  local rs_user; rs_user=$(resource_user)
+  say "checking which port is free on remote $resource ..."
+  local chosen_port=""
+  local cand
+  for cand in "$PORT" $((PORT+1)) $((PORT+2)) $((PORT+3)) $((PORT+4)) $((PORT+5)) $((PORT+6)) $((PORT+7)); do
+    if pw ssh "$resource" "ss -tlnp 2>/dev/null | grep -q ':${cand} ' && echo BUSY || echo FREE" 2>/dev/null | grep -q FREE; then
+      chosen_port="$cand"
+      break
+    fi
+  done
+  if [[ -z "$chosen_port" ]]; then
+    err "no free port in ${PORT}..$((PORT+7)) on $resource. Run \`pwrelay doctor $resource\`."
+    exit 1
+  fi
+  if [[ "$chosen_port" != "$PORT" ]]; then
+    say "port ${PORT} on remote is busy (likely pw-agent caching a prior forward); using ${chosen_port}"
+  fi
+  echo "$chosen_port" > "$PID_PORT"
+  echo "$resource" > "$PID_RESOURCE"
+
+  # Drop the chosen port on the remote so the NMH wrapper can read it.
+  # This way the in-VDI Chrome's NMH always finds the live port without
+  # touching its already-running profile.
+  local remote_port_file="/tmp/pw-relay-port-${rs_user}"
+  pw ssh "$resource" "echo ${chosen_port} > ${remote_port_file}" 2>/dev/null || true
+
+  # Unique marker so cmd_down can identify *our* sleep on the remote and
+  # not collide with another pwrelay instance the user may have running.
+  local session_id; session_id="pwrelay-$(date +%s)-$$"
+  echo "$session_id" > "$PID_SESSION"
+
   # Agent.
-  say "starting agent on 127.0.0.1:${PORT}"
-  python3 "$HERE/laptop/agent.py" --port "$PORT" >"$LOG_AGENT" 2>&1 &
+  say "starting agent on 127.0.0.1:${chosen_port}"
+  python3 "$HERE/laptop/agent.py" --port "$chosen_port" >"$LOG_AGENT" 2>&1 &
   echo $! > "$PID_AGENT"
   sleep 0.6
   if ! is_running "$PID_AGENT"; then
@@ -143,14 +186,15 @@ cmd_up() {
     sed -n '1,20p' "$LOG_AGENT" >&2 || true
     exit 1
   fi
-  ok "agent listening on 127.0.0.1:${PORT}"
+  ok "agent listening on 127.0.0.1:${chosen_port}"
 
   # Tunnel — wrapped in a supervisor loop so the connection respawns if the
   # cluster drops the session (NOAA Gaea has been seen to idle-timeout after
   # roughly an hour even with ServerAliveInterval set). The supervisor itself
   # is what we put in PID_TUNNEL; killing it exits the loop cleanly.
-  local rs_user; rs_user=$(resource_user)
-  say "opening reverse tunnel via pw ssh to $resource ($rs_user@$resource) [auto-reconnect]"
+  # The remote bash uses `exec -a` to rename the sleep process so cmd_down
+  # can pkill *only our* keepalive without touching anyone else's.
+  say "opening reverse tunnel via pw ssh to $resource ($rs_user@$resource) [auto-reconnect, port ${chosen_port}]"
   : >"$LOG_TUNNEL"
   (
     while true; do
@@ -158,12 +202,11 @@ cmd_up() {
           -o ProxyCommand="pw ssh --proxy-command %h" \
           -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
           -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-          -o ExitOnForwardFailure=yes \
-          -R "${PORT}:127.0.0.1:${PORT}" \
+          -o TCPKeepAlive=yes -o ExitOnForwardFailure=yes \
+          -R "${chosen_port}:127.0.0.1:${chosen_port}" \
           "${rs_user}@${resource}" \
-          'echo "[remote] tunnel-up on $(hostname); pid=$$"; exec sleep 86400'
+          "echo '[remote] tunnel-up on \$(hostname); pid=\$\$ marker=${session_id}'; exec -a '${session_id}' sleep 86400"
       rc=$?
-      # Auth or port-conflict failures are terminal — don't busy-loop.
       if grep -qE "Permission denied|remote port forwarding failed" "$LOG_TUNNEL" 2>/dev/null; then
         echo "[supervisor] terminal failure (rc=$rc); not retrying" >>"$LOG_TUNNEL"
         exit "$rc"
@@ -186,12 +229,10 @@ cmd_up() {
       exit 1
     fi
     if ! is_running "$PID_TUNNEL"; then
-      # Surface specific known failure patterns clearly. Never tell users to
-      # kill a remote `pw` process — that's their cluster's per-user agent.
       if grep -q "remote port forwarding failed for listen port" "$LOG_TUNNEL" 2>/dev/null; then
-        err "remote port ${PORT} is already bound by another process on the cluster."
-        err "common cause: a previous pwrelay session left a stale ssh -R holding the port."
-        err "to clean it up: pw ssh <resource> 'pgrep -u \$USER -af \"sleep 86400\" | awk \"{print \\\$1}\" | xargs -r kill'"
+        err "every port in ${PORT}..$((PORT+7)) was rejected on $resource."
+        err "the pw-agent on the cluster may be holding stale forward state across a wide range."
+        err "try \`pwrelay doctor $resource\` for a state dump, or open a fresh pw context."
         err "DO NOT kill any process named 'pw agent' on the remote — that's your cluster's per-user daemon."
       elif grep -q "Permission denied (publickey)" "$LOG_TUNNEL" 2>/dev/null; then
         err "ssh public-key auth refused. \`pw auth login\` to refresh, then retry."
@@ -204,7 +245,7 @@ cmd_up() {
     fi
   done
   local rhost; rhost=$(grep -m1 "tunnel-up on" "$LOG_TUNNEL" | sed 's/.*tunnel-up on //; s/;.*//')
-  ok "tunnel up to $rhost — port ${PORT} on remote -> agent on this laptop"
+  ok "tunnel up to $rhost — port ${chosen_port} on remote -> agent on this laptop"
 
   cat <<EOF
 
@@ -226,9 +267,66 @@ EOF
 # ---- down ------------------------------------------------------------------
 
 cmd_down() {
+  # Best-effort: tell the remote to kill *our* marked sleep first, so the
+  # pw agent releases the port quickly instead of caching the forward.
+  if [[ -f "$PID_SESSION" && -f "$PID_RESOURCE" ]]; then
+    local sid res
+    sid=$(cat "$PID_SESSION" 2>/dev/null || true)
+    res=$(cat "$PID_RESOURCE" 2>/dev/null || true)
+    if [[ -n "$sid" && -n "$res" ]]; then
+      say "asking remote ($res) to release our session marker '${sid}'"
+      pw ssh "$res" "pkill -u \$(whoami) -f \"${sid}\" 2>/dev/null; true" >/dev/null 2>&1 || true
+    fi
+  fi
   stop_pid "$PID_TUNNEL" "ssh tunnel"
   stop_pid "$PID_AGENT" "agent"
+  rm -f "$PID_PORT" "$PID_SESSION" "$PID_RESOURCE"
   ok "relay stopped"
+}
+
+# ---- doctor ----------------------------------------------------------------
+
+cmd_doctor() {
+  local resource; resource=$(resolve_resource "${1:-}")
+  say "=== local (this laptop) ==="
+  cmd_status
+  echo "  port file : $(cat "$PID_PORT" 2>/dev/null || echo '(none)')"
+  echo "  session   : $(cat "$PID_SESSION" 2>/dev/null || echo '(none)')"
+  echo "  resource  : $(cat "$PID_RESOURCE" 2>/dev/null || echo '(none)')"
+  echo
+  echo "  agent log tail:"
+  tail -3 "$LOG_AGENT" 2>/dev/null | sed 's/^/    /'
+  echo "  tunnel log tail:"
+  tail -5 "$LOG_TUNNEL" 2>/dev/null | sed 's/^/    /'
+  echo
+  say "=== remote ($resource) ==="
+  pw ssh "$resource" '
+    echo "  hostname  : $(hostname)"
+    echo "  whoami    : $(whoami)"
+    echo "  ports 7777..7785 (listening):"
+    ss -tlnp 2>/dev/null | awk "/:777[0-9] /{ printf \"    %s  %s\n\", \$4, \$6 }"
+    echo "  my pwrelay-tagged sleeps (safe to kill via pwrelay reset):"
+    ps -u "$(whoami)" -o pid,comm 2>/dev/null | awk "/pwrelay-/{ printf \"    pid=%s argv0=%s\n\", \$1, \$2 }"
+    echo "  pw agent (DO NOT KILL):"
+    pgrep -afu "$(whoami)" "pw agent" 2>/dev/null | sed "s/^/    /"
+    echo "  port hint file:"
+    cat "/tmp/pw-relay-port-$(whoami)" 2>/dev/null | sed "s/^/    /"
+  ' 2>&1 | head -40
+}
+
+# ---- reset -----------------------------------------------------------------
+
+cmd_reset() {
+  local resource
+  resource=$(cat "$PID_RESOURCE" 2>/dev/null || resolve_resource "${1:-}")
+  say "resetting local pwrelay state (does NOT touch any pw agent)"
+  cmd_down >/dev/null 2>&1 || true
+  pkill -f "$HERE/laptop/agent.py" 2>/dev/null || true
+  if [[ -n "$resource" ]]; then
+    say "asking $resource to kill ALL pwrelay-tagged sleeps for this user"
+    pw ssh "$resource" 'pkill -u $(whoami) -f "pwrelay-" 2>/dev/null; rm -f /tmp/pw-relay-port-$(whoami); true' >/dev/null 2>&1 || true
+  fi
+  ok "reset complete"
 }
 
 # ---- status ----------------------------------------------------------------
@@ -254,11 +352,13 @@ case "${1:-}" in
   up)       shift; cmd_up "$@" ;;
   down|stop) cmd_down ;;
   status)   cmd_status ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  reset)    shift; cmd_reset "$@" ;;
   ""|-h|--help|help)
-    sed -n '2,15p' "$0" ;;
+    sed -n '2,17p' "$0" ;;
   *)
     err "unknown subcommand: $1"
-    sed -n '2,15p' "$0" >&2
+    sed -n '2,17p' "$0" >&2
     exit 1
     ;;
 esac

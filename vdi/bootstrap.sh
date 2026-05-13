@@ -68,9 +68,16 @@ for cand in python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 pytho
 done
 [[ -n "$PYTHON_BIN" ]] || { echo "no python 3.7+ on PATH" >&2; exit 1; }
 
-# Wrapper so Chrome spawns the NMH with the python we picked.
+# Wrapper so Chrome spawns the NMH with the python we picked. The wrapper
+# also reads /tmp/pw-relay-port-<user> (written by `pwrelay up` on the
+# laptop side) so a fresh NMH always connects to the currently-live port
+# even if `pwrelay up` had to fall back to 7778/7779/etc.
 cat > "${NMH_DIR}/relay-wrapper.sh" <<EOF
 #!/usr/bin/env bash
+PORT_HINT="/tmp/pw-relay-port-\${USER}"
+if [[ -r "\$PORT_HINT" ]]; then
+  export PW_RELAY_PORT="\$(cat "\$PORT_HINT")"
+fi
 exec ${PYTHON_BIN} ${NMH_DIR}/relay.py "\$@"
 EOF
 chmod +x "${NMH_DIR}/relay-wrapper.sh"
