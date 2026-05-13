@@ -1,11 +1,12 @@
-# CAC / PIV smartcard relay (planned)
+# CAC / PIV smartcard relay (early scaffolding)
 
 Sibling to `vdi/` for FIDO2 — forwards the user's CAC / PIV smartcard
 from the laptop's USB CCID reader to the in-VDI Chrome so TLS
 client-cert sign-in works against `sso.noaa.gov` and similar services.
 
-**Status: design only.** See [`docs/cac-relay-design.md`](../docs/cac-relay-design.md)
-for the architecture and the path forward.
+**Status:** Phase 2 in progress. `agent.sh` works for local-loopback
+testing; integration with `pwrelay` and the VDI-side NSS module install
+is still TODO. See [`../docs/cac-relay-design.md`](../docs/cac-relay-design.md).
 
 ## Architecture (one line)
 
@@ -18,18 +19,42 @@ to forward CTAPHID CBOR frames. CAC/PIV is **TLS-client-cert auth** —
 intercepted at the NSS / PKCS#11 layer, below the browser. Completely
 different code, even though the `pw ssh -R` tunnel pattern is the same.
 
-## Files (when this is built)
+## Files
 
 ```
-agent.sh         laptop-side: p11-kit server wrapping OpenSC, listening on a
-                 local TCP port the pw ssh -R tunnel reaches
-bootstrap.sh     VDI-side: installs p11-kit-client module + registers with NSS
-test-tls.sh      smoke test: openssl s_client against an NOAA endpoint
+agent.sh         laptop-side: p11-kit server wrapping OpenSC, bridged to TCP
+                 via socat. [DONE — first draft]
+bootstrap.sh     VDI-side: installs p11-kit-client module + registers
+                 with NSS. [TODO]
+test-tls.sh      smoke test: openssl s_client against an NOAA endpoint.
+                 [TODO]
 ```
 
-None of these exist yet. The current placeholder is so a future
-implementer has the directory structure ready and the design doc
-right next door.
+## Try the laptop side standalone (Mac/Linux)
+
+```bash
+brew install opensc p11-kit socat        # Mac, one time
+bash pcsc/agent.sh                       # exposes CAC on 127.0.0.1:7888
+```
+
+In another terminal:
+
+```bash
+pkcs11-tool --module $(brew --prefix)/lib/p11-kit-client.so --list-slots \
+    --slot-index 0
+```
+
+You should see the CAC's slots / certs. From here the missing piece
+is wiring the VDI side to use `p11-kit-client.so` via NSS so Chrome
+in the VDI picks the cert up.
+
+## Windows laptop note
+
+The current `agent.sh` is Bash + `p11-kit server` + `socat`. On
+Windows the equivalent stack doesn't exist out of the box. We'll need
+to write a parallel `agent.py` (similar to `laptop/agent.py` for FIDO)
+that talks PKCS#11 directly via a Python binding and forwards to a TCP
+socket. See the design doc's "Open questions" section.
 
 ## See also
 
