@@ -55,17 +55,26 @@ def main() -> int:
         if sock_open:  rlist.append(sock_fd)
         if not rlist:
             break
-        r, _, _ = select.select(rlist, [], [], 30.0)
+        try:
+            r, _, _ = select.select(rlist, [], [], 30.0)
+        except InterruptedError:
+            continue
 
         if stdin_fd in r:
             try:
                 buf = os.read(stdin_fd, 65536)
             except (BlockingIOError, InterruptedError):
-                buf = b""
-            if buf == b"":
-                # stdin EOF — half-close the send side. Don't close the
-                # recv side; p11-kit-server may still write more before
-                # noticing the FIN.
+                # Spurious wakeup or interrupted syscall — NOT EOF.
+                # Treating this as EOF was an iter46 bug that caused
+                # the socket's send side to be half-closed mid-RPC,
+                # truncating long signing responses and yielding
+                # ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED in Chrome.
+                buf = None
+            if buf is None:
+                pass  # retry on next select iteration
+            elif buf == b"":
+                # Real EOF on stdin — half-close the socket's send side.
+                # Don't close recv; p11-kit-server may still drain.
                 try:
                     sock.shutdown(socket.SHUT_WR)
                 except OSError:
@@ -78,8 +87,10 @@ def main() -> int:
             try:
                 buf = sock.recv(65536)
             except (BlockingIOError, InterruptedError):
-                buf = b""
-            if buf == b"":
+                buf = None
+            if buf is None:
+                pass  # retry on next select iteration
+            elif buf == b"":
                 sock_open = False
             else:
                 _write_all(stdout_fd, buf, is_socket=False)
