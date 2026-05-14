@@ -63,23 +63,31 @@ for cmd in modutil certutil; do
 done
 
 BRIDGE_CMD=""
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    PY=$(command -v "$cand"); break
+  fi
+done
+
 if command -v socat >/dev/null 2>&1; then
   # `socat - TCP:host:port` — stdin/stdout bridged to a TCP socket.
   BRIDGE_CMD="socat - TCP:127.0.0.1:${PORT}"
+elif [[ -n "$PY" ]]; then
+  # Python bridge — most reliable across platforms. Empirically ncat's
+  # --no-shutdown semantics don't always let p11-kit-client complete a
+  # slot enumeration on Rocky 9.6 even with TCP connectivity intact.
+  # The Python bridge gives us explicit control of half-close behavior.
+  HERE="$(cd "$(dirname "$0")" && pwd)"
+  BRIDGE_CMD="$PY $HERE/stdio_bridge.py 127.0.0.1 ${PORT}"
 elif command -v ncat >/dev/null 2>&1; then
-  # ncat is Nmap's improved netcat. Connect mode by default, full-duplex
-  # over stdio. `--no-shutdown` keeps stdin open after the remote half
-  # closes (p11-kit may continue writing after a server-side EOF).
+  # Fallback only — keep as a last resort. ncat is Nmap's improved
+  # netcat; --no-shutdown keeps stdin open after the remote half closes.
   BRIDGE_CMD="ncat --no-shutdown 127.0.0.1 ${PORT}"
 elif command -v nc >/dev/null 2>&1; then
-  # OpenBSD / GNU netcat: -N closes the network side when stdin EOFs;
-  # we don't want that, so we omit it. Plain `nc <host> <port>` is the
-  # most-portable form across nc variants.
   BRIDGE_CMD="nc 127.0.0.1 ${PORT}"
 else
-  err "no stdio<->TCP bridge tool found. Need ONE of: socat / ncat / nc"
-  err "  Debian/Ubuntu: sudo apt install ncat   (or socat / netcat-openbsd)"
-  err "  RHEL/Rocky:    sudo dnf install ncat   (or socat)"
+  err "no stdio<->TCP bridge tool found. Need socat, python3, ncat, or nc."
   exit 1
 fi
 say "using bridge: $BRIDGE_CMD"
