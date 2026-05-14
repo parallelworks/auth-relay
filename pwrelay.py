@@ -564,15 +564,23 @@ def _open_vnc_locally(session: dict) -> None:
         err(f"Open manually: {url}")
 
 
+MARKETPLACE_SLUG = "marketplace/auth_relay"
+SAVED_NAME_CANDIDATES = ("auth_relay", "auth-relay", "pw-auth-relay", "authrelay")
+
+
 def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
     """Run the bootstrap workflow on ACTIVATE.
 
-    Prefers running the user's saved workflow named ``auth_relay`` if
-    one exists. Falls back to uploading the in-repo workflow.yaml as an
-    ad-hoc submission. The fallback path runs into a 409 slug-conflict
-    if the YAML has been submitted before (ACTIVATE derives a slug from
-    the YAML and refuses to re-create it), so the saved-name path is
-    the reliable one once the workflow has been imported.
+    Invocation priority:
+      1. ``marketplace/auth_relay`` — the canonical published workflow
+         (https://noaa.parallel.works/market/i/auth_relay). Works for
+         every user without first importing into their own account.
+      2. A saved workflow in the user's own account whose name matches
+         one of SAVED_NAME_CANDIDATES — useful if the user has a forked
+         or hand-edited version.
+      3. The in-repo workflow.yaml as an ad-hoc upload. This path hits
+         a 409 slug conflict if the YAML has been uploaded before, so
+         it's the last resort.
     """
     import json as _json
     pw = shutil.which("pw")
@@ -580,7 +588,6 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
         err("pw CLI not on PATH — can't run the bootstrap workflow.")
         sys.exit(1)
 
-    workflow_yaml = REPO_ROOT / "workflow.yaml"
     inputs = {
         "resource": resource,
         "install_location": "home",
@@ -592,9 +599,26 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
     }
     inputs_json = _json.dumps(inputs)
 
-    # Find a saved workflow that looks like ours. We auto-saved it once
-    # the first time the user uploaded the YAML; subsequent runs should
-    # invoke that saved version by name to avoid the slug 409.
+    def _try_run(target: str, label: str) -> int:
+        say(f"running workflow '{label}' on {resource}"
+            + (" (with --cac)" if cac_enabled else ""))
+        say(f"  inputs: {inputs_json}")
+        return subprocess.run(
+            [pw, "workflows", "run", target,
+             "-i", inputs_json,
+             "--name", f"pwrelay-bootstrap-{int(time.time())}",
+             "-o", "text"],
+            check=False,
+        ).returncode
+
+    # Tier 1: marketplace
+    rc = _try_run(MARKETPLACE_SLUG, MARKETPLACE_SLUG)
+    if rc == 0:
+        ok("bootstrap workflow complete (marketplace)")
+        return
+    say(f"marketplace workflow run failed (rc={rc}); trying user-account-saved versions...")
+
+    # Tier 2: user's saved workflow
     saved_name = ""
     try:
         ls = subprocess.run(
@@ -603,64 +627,28 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
         )
         for line in ls.stdout.splitlines():
             n = line.strip()
-            # Match common slugs we expect to see for this repo's workflow.
-            if n in ("auth_relay", "auth-relay", "pw-auth-relay", "authrelay"):
+            if n in SAVED_NAME_CANDIDATES:
                 saved_name = n
                 break
     except Exception:
         pass
-
-    target = saved_name or str(workflow_yaml)
     if saved_name:
-        say(f"running saved workflow '{saved_name}' on {resource}"
-            + (" (with --cac)" if cac_enabled else ""))
-    else:
-        if not workflow_yaml.exists():
-            err(f"workflow.yaml not found at {workflow_yaml} — can't auto-bootstrap.")
-            sys.exit(1)
-        say(f"running workflow.yaml on {resource} (first-time upload — "
-            + "subsequent runs will reuse the saved version)")
+        rc = _try_run(saved_name, saved_name)
+        if rc == 0:
+            ok(f"bootstrap workflow '{saved_name}' complete")
+            return
 
-    say(f"  inputs: {inputs_json}")
-    proc = subprocess.run(
-        [pw, "workflows", "run", target,
-         "-i", inputs_json,
-         "--name", f"pwrelay-bootstrap-{int(time.time())}",
-         "-o", "text"],
-        check=False,
-    )
-    if proc.returncode != 0:
-        # Common case: first upload hit slug-conflict, but a saved
-        # workflow now exists. Retry by saved name on conflict.
-        if not saved_name:
-            err("workflow run failed (likely slug conflict on first upload).")
-            err("Re-checking saved workflows and retrying by name...")
-            try:
-                ls = subprocess.run(
-                    [pw, "workflows", "ls", "-o", "list"],
-                    capture_output=True, text=True, check=False, timeout=10,
-                )
-                for line in ls.stdout.splitlines():
-                    n = line.strip()
-                    if n in ("auth_relay", "auth-relay", "pw-auth-relay", "authrelay"):
-                        proc = subprocess.run(
-                            [pw, "workflows", "run", n,
-                             "-i", inputs_json,
-                             "--name", f"pwrelay-bootstrap-{int(time.time())}",
-                             "-o", "text"],
-                            check=False,
-                        )
-                        if proc.returncode == 0:
-                            ok(f"bootstrap workflow '{n}' complete (retry)")
-                            return
-                        break
-            except Exception:
-                pass
-        err(f"workflow run exited rc={proc.returncode}.")
-        err("Bootstrap may have partially succeeded — `pw workflows runs ls` to inspect.")
-        err("Continuing anyway; drop --workflow next time to skip this step.")
-    else:
-        ok("bootstrap workflow complete")
+    # Tier 3: local YAML upload
+    workflow_yaml = REPO_ROOT / "workflow.yaml"
+    if workflow_yaml.exists():
+        rc = _try_run(str(workflow_yaml), "in-repo workflow.yaml")
+        if rc == 0:
+            ok("bootstrap workflow complete (local upload)")
+            return
+
+    err(f"all bootstrap workflow paths failed (last rc={rc}).")
+    err(f"Inspect via: pw workflows runs ls")
+    err("Continuing anyway; drop --workflow next time to skip this step.")
 
 
 def _clear_stale_local_state() -> None:
