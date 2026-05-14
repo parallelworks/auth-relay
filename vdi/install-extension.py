@@ -356,10 +356,22 @@ def main() -> int:
         # the proc crashes before the CDP handshake completes.
         "--disable-gpu",
         "--disable-software-rasterizer",
-        # NOTE: --use-gl=swiftshader was here in iter40 under a wrong
-        # GLX-absent hypothesis. It forces all OpenGL through CPU and
-        # makes chrome unusably slow on VNC. Removed; --disable-gpu
-        # alone is enough for the install step too.
+        # --use-gl=swiftshader IS NECESSARY HERE (but only here, not in
+        # the persistent-chrome wrapper). Reasoning:
+        #
+        # install-extension.py talks to chrome over --remote-debugging-pipe.
+        # On Ursa's TigerVNC the X server has no GLX extension; chrome's
+        # GPU process tries to init GL, fails repeatedly, exits — and on
+        # this chrome version the GPU-process exit tears down the
+        # DevTools pipe with "Chrome closed CDP pipe before replying"
+        # before our Extensions.loadUnpacked request lands.
+        #
+        # SwiftShader keeps the GPU process happy (it's slow but doesn't
+        # crash), so the CDP pipe stays alive long enough for the install.
+        # The wrapper-launched persistent chrome doesn't have a CDP pipe
+        # to lose, so it can run without swiftshader and get fast software
+        # rendering for the UI.
+        "--use-gl=swiftshader",
         "--disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer",
         # Cap renderer forks — Ursa's default ulimit -u is 1024 and
         # Chrome easily blows past that when left uncapped.
