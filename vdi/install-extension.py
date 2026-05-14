@@ -277,6 +277,15 @@ def main() -> int:
         help="Leave Chrome running after install (default). Pass --no-keep-running to exit Chrome.",
     )
     ap.add_argument("--no-keep-running", action="store_false", dest="keep_running")
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run the CDP install even if the extension is already "
+             "registered in this profile. Normally a no-op when re-run; "
+             "use --force to recover from a corrupted install. NOTE: "
+             "repeated --force on shared filesystems (Lustre/NFS) can "
+             "corrupt chrome's Service Worker IndexedDB.",
+    )
     args = ap.parse_args()
 
     ext_dir = Path(args.ext_dir).resolve()
@@ -292,6 +301,23 @@ def main() -> int:
     print(f"[install] Extension: {ext_dir}")
     print(f"[install] Profile  : {profile}")
     print(f"[install] CDP port : {debug_port}")
+
+    # Idempotency check — if our extension is already registered in this
+    # profile (we can see the install-time-created Extensions/<ID>/...
+    # subdir), skip the CDP install dance entirely. Re-running this
+    # script otherwise hard-kills chrome via the CDP-pipe close at
+    # script exit, which on Lustre/NFS-style filesystems (Ursa, Gaea)
+    # leaves chrome's Service Worker IndexedDB in an inconsistent state.
+    # Each repeat accumulates corruption until SW registration fails
+    # with 'Database IO error' (status code: 2). Skipping the re-install
+    # entirely prevents the corruption cycle.
+    ext_id = "ifmfpjglkeipojipfiolefflhopdflgf"   # deterministic from manifest "key"
+    installed_dir = profile / "Default" / "Extensions" / ext_id
+    if installed_dir.exists() and not args.force:
+        print(f"[install] extension {ext_id} already installed at "
+              f"{installed_dir} — nothing to do.")
+        print("[install] (pass --force to re-run the CDP install anyway)")
+        return 0
 
     seed_dev_mode(profile)
 
