@@ -436,6 +436,64 @@ def _pick_remote_port(resource: str, default: int, label: str) -> int:
     sys.exit(1)
 
 
+def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
+    """Submit the in-repo workflow.yaml via `pw workflows run`.
+
+    This installs the relay on the remote — clones the repo, installs
+    portable Chrome, registers the chrome extension, optionally
+    registers the CAC PKCS#11 module — without the user having to open
+    the ACTIVATE web UI. Inputs we set:
+      resource         -> the cluster the user picked
+      install_location -> "home" (the safest default)
+      branch           -> "main"
+      seed_bookmarks   -> true
+      auto_launch_chrome -> true
+      enable_cac       -> mirrors --cac
+    """
+    import json as _json
+    workflow_yaml = REPO_ROOT / "workflow.yaml"
+    if not workflow_yaml.exists():
+        err(f"workflow.yaml not found at {workflow_yaml} — can't auto-bootstrap.")
+        err("(Pass --no-workflow to skip and bootstrap the remote manually.)")
+        sys.exit(1)
+
+    pw = shutil.which("pw")
+    if not pw:
+        err("pw CLI not on PATH — can't run the bootstrap workflow.")
+        sys.exit(1)
+
+    inputs = {
+        "resource": resource,
+        "install_location": "home",
+        "custom_relay_dir": "",
+        "branch": "main",
+        "seed_bookmarks": True,
+        "auto_launch_chrome": True,
+        "enable_cac": bool(cac_enabled),
+    }
+    inputs_json = _json.dumps(inputs)
+    say(f"running bootstrap workflow on {resource} (this provisions chrome + extension"
+        + (" + CAC module" if cac_enabled else "")
+        + " — typically 30–90s)")
+    say(f"  workflow.yaml: {workflow_yaml}")
+    say(f"  inputs: {inputs_json}")
+
+    # Stream stdout/stderr through so the user sees the workflow's progress.
+    proc = subprocess.run(
+        [pw, "workflows", "run", str(workflow_yaml),
+         "-i", inputs_json,
+         "--name", f"pwrelay-bootstrap-{int(time.time())}",
+         "-o", "text"],
+        check=False,
+    )
+    if proc.returncode != 0:
+        err(f"workflow run exited rc={proc.returncode}.")
+        err("Bootstrap may have partially succeeded — `pw workflows runs ls` to inspect.")
+        err("Continuing anyway; pass --no-workflow next time to skip this step.")
+    else:
+        ok("bootstrap workflow complete")
+
+
 def cmd_up(args: argparse.Namespace) -> None:
     resource = _resolve_resource(args.resource)
 
@@ -457,6 +515,13 @@ def cmd_up(args: argparse.Namespace) -> None:
     if fido_enabled and not vp.exists():
         err("venv not found. Run: pwrelay setup")
         sys.exit(1)
+
+    # Run the bootstrap workflow on the remote BEFORE we open the tunnels.
+    # On success the VDI has chrome + extension + (optionally) the CAC
+    # PKCS#11 module wired up, so the user's first chrome launch on the
+    # other end Just Works.
+    if not args.no_workflow:
+        _run_bootstrap_workflow(resource, cac_enabled)
 
     rs_user = _resource_user()
     session_id = f"pwrelay-{int(time.time())}-{os.getpid()}"
@@ -724,6 +789,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-fido", action="store_true",
         help="skip the FIDO2 (YubiKey) tunnel entirely. Pair with --cac for "
              "CAC-only operation.")
+    p_up.add_argument(
+        "--no-workflow", action="store_true",
+        help="skip running the ACTIVATE bootstrap workflow on the remote. "
+             "By default, pwrelay submits the in-repo workflow.yaml via "
+             "`pw workflows run` so the VDI side (chrome install, extension, "
+             "CAC module) is set up in the same command. Pass this to manage "
+             "the remote side manually.")
     sub.add_parser("down")
     sub.add_parser("stop")
     sub.add_parser("status")
