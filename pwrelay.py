@@ -657,6 +657,46 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
         ok("bootstrap workflow complete")
 
 
+def _clear_stale_local_state() -> None:
+    """Remove state files whose PID is no longer alive.
+
+    Without this, a kill -9 of a previous pwrelay leaves the PID files
+    behind, and `_is_running` returns False (process gone) but the file
+    still exists — confusing later code paths. Cleaning lets a fresh
+    `up` proceed cleanly even after an unclean exit.
+    """
+    for pid_path in (PID_AGENT, PID_TUNNEL, PID_CAC_AGENT, PID_CAC_TUNNEL):
+        if pid_path.exists() and not _is_running(pid_path):
+            try: pid_path.unlink()
+            except FileNotFoundError: pass
+
+
+def _clean_phantom_sleeps_on_remote(resource: str) -> None:
+    """Kill ALL pwrelay-tagged sleeps on the remote for this user.
+
+    Phantom accumulation: each `pwrelay up` opens reverse tunnels whose
+    remote endpoint is a tagged `sleep`. If a previous run died unclean
+    (laptop SIGKILL, network drop, etc.), the remote `sleep` plus its
+    parent ssh peer can linger — pw agent then caches the port forward
+    indefinitely, port-fallback bumps the new session to a higher port,
+    and over time the cluster fills with phantom processes.
+
+    Hard-clean every time we start: SSH in and kill any process under
+    this user named `pwrelay-*`. NEVER touches the pw agent itself.
+    Safe because the sleeps are ours by construction (we set argv[0] to
+    `pwrelay-<session>-<role>` via bash's `exec -a`).
+    """
+    say(f"clearing any phantom pwrelay sleeps on {resource} from prior sessions")
+    subprocess.run(
+        ["pw", "ssh", resource,
+         'pkill -u "$(id -un)" -f "pwrelay-" 2>/dev/null; '
+         'rm -f /tmp/pw-relay-port-$(id -un) 2>/dev/null; true'],
+        check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=20,
+    )
+
+
 def cmd_up(args: argparse.Namespace) -> None:
     resource = _resolve_resource(args.resource)
 
@@ -667,12 +707,20 @@ def cmd_up(args: argparse.Namespace) -> None:
         err("drop --no-fido, or add --cac, or both.")
         sys.exit(1)
 
+    # Sweep dead PID files so a kill -9'd previous run doesn't block us.
+    _clear_stale_local_state()
+
     if fido_enabled and _is_running(PID_AGENT):
         say(f"FIDO agent already running (pid {_read_pid(PID_AGENT)}). Use `pwrelay down` first.")
         sys.exit(1)
     if cac_enabled and _is_running(PID_CAC_AGENT):
         say(f"CAC agent already running (pid {_read_pid(PID_CAC_AGENT)}). Use `pwrelay down` first.")
         sys.exit(1)
+
+    # Clean the remote BEFORE picking ports. Otherwise pw-agent's cached
+    # port reservations from phantom sessions push us to ever-higher
+    # ports (7777 -> 7778 -> 7779 -> ... and 7888 -> 7889 -> ...).
+    _clean_phantom_sleeps_on_remote(resource)
 
     vp = _venv_python()
     if fido_enabled and not vp.exists():
