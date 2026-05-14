@@ -59,6 +59,41 @@ EOF
 # NativeMessagingHosts/ so #1 resolves correctly.
 PW_CHROME_USER_DATA_DIR="${PW_CHROME_USER_DATA_DIR:-$HOME/.config/google-chrome-pwrelay}"
 mkdir -p "$PW_CHROME_USER_DATA_DIR" 2>/dev/null || true
+
+# Stale SingletonLock cleanup.
+#
+# Chrome stores its single-instance lock as a symlink at
+# $PW_CHROME_USER_DATA_DIR/SingletonLock whose target is "<hostname>-<pid>".
+# If chrome was hard-killed (kill -9, OOM, VDI session ended uncleanly,
+# etc.) the symlink is left behind pointing at a dead pid. Future
+# launches see the lock, assume another chrome is running, and either
+# silently exit ("Opening in existing browser session" but no window
+# appears) or hang.
+#
+# This was the root cause of "desktop icon doesn't work", "workflow
+# auto-launch shows nothing", and the recurring "chrome stuck" reports.
+#
+# Detect-and-clean: read the symlink target's pid, verify the pid is
+# alive AND its /proc/<pid>/exe points to our chrome binary. If either
+# check fails, the lock is stale — delete all three Singleton* files.
+_lock="$PW_CHROME_USER_DATA_DIR/SingletonLock"
+if [[ -L "$_lock" ]]; then
+  _target="$(readlink "$_lock" 2>/dev/null || true)"
+  _lockpid="${_target##*-}"   # everything after the last '-'
+  _stale=true
+  if [[ -n "$_lockpid" && "$_lockpid" =~ ^[0-9]+$ ]]; then
+    if [[ -e "/proc/$_lockpid/exe" ]]; then
+      _exe="$(readlink "/proc/$_lockpid/exe" 2>/dev/null || true)"
+      [[ "$_exe" == "$CHROME" ]] && _stale=false
+    fi
+  fi
+  if $_stale; then
+    rm -f "$_lock" \
+          "$PW_CHROME_USER_DATA_DIR/SingletonCookie" \
+          "$PW_CHROME_USER_DATA_DIR/SingletonSocket" 2>/dev/null || true
+    echo "[chrome] cleared stale SingletonLock (was pointing at $_target)" >&2
+  fi
+fi
 #
 # Redirect Chrome's stderr/stdout to a log file. Chrome dumps a *lot* of
 # debug info to stderr by default; left attached to a terminal that
