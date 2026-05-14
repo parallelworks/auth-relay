@@ -437,31 +437,22 @@ def _pick_remote_port(resource: str, default: int, label: str) -> int:
 
 
 def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
-    """Submit the in-repo workflow.yaml via `pw workflows run`.
+    """Run the bootstrap workflow on ACTIVATE.
 
-    This installs the relay on the remote — clones the repo, installs
-    portable Chrome, registers the chrome extension, optionally
-    registers the CAC PKCS#11 module — without the user having to open
-    the ACTIVATE web UI. Inputs we set:
-      resource         -> the cluster the user picked
-      install_location -> "home" (the safest default)
-      branch           -> "main"
-      seed_bookmarks   -> true
-      auto_launch_chrome -> true
-      enable_cac       -> mirrors --cac
+    Prefers running the user's saved workflow named ``auth_relay`` if
+    one exists. Falls back to uploading the in-repo workflow.yaml as an
+    ad-hoc submission. The fallback path runs into a 409 slug-conflict
+    if the YAML has been submitted before (ACTIVATE derives a slug from
+    the YAML and refuses to re-create it), so the saved-name path is
+    the reliable one once the workflow has been imported.
     """
     import json as _json
-    workflow_yaml = REPO_ROOT / "workflow.yaml"
-    if not workflow_yaml.exists():
-        err(f"workflow.yaml not found at {workflow_yaml} — can't auto-bootstrap.")
-        err("(Pass --no-workflow to skip and bootstrap the remote manually.)")
-        sys.exit(1)
-
     pw = shutil.which("pw")
     if not pw:
         err("pw CLI not on PATH — can't run the bootstrap workflow.")
         sys.exit(1)
 
+    workflow_yaml = REPO_ROOT / "workflow.yaml"
     inputs = {
         "resource": resource,
         "install_location": "home",
@@ -472,24 +463,74 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
         "enable_cac": bool(cac_enabled),
     }
     inputs_json = _json.dumps(inputs)
-    say(f"running bootstrap workflow on {resource} (this provisions chrome + extension"
-        + (" + CAC module" if cac_enabled else "")
-        + " — typically 30–90s)")
-    say(f"  workflow.yaml: {workflow_yaml}")
-    say(f"  inputs: {inputs_json}")
 
-    # Stream stdout/stderr through so the user sees the workflow's progress.
+    # Find a saved workflow that looks like ours. We auto-saved it once
+    # the first time the user uploaded the YAML; subsequent runs should
+    # invoke that saved version by name to avoid the slug 409.
+    saved_name = ""
+    try:
+        ls = subprocess.run(
+            [pw, "workflows", "ls", "-o", "list"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        for line in ls.stdout.splitlines():
+            n = line.strip()
+            # Match common slugs we expect to see for this repo's workflow.
+            if n in ("auth_relay", "auth-relay", "pw-auth-relay", "authrelay"):
+                saved_name = n
+                break
+    except Exception:
+        pass
+
+    target = saved_name or str(workflow_yaml)
+    if saved_name:
+        say(f"running saved workflow '{saved_name}' on {resource}"
+            + (" (with --cac)" if cac_enabled else ""))
+    else:
+        if not workflow_yaml.exists():
+            err(f"workflow.yaml not found at {workflow_yaml} — can't auto-bootstrap.")
+            sys.exit(1)
+        say(f"running workflow.yaml on {resource} (first-time upload — "
+            + "subsequent runs will reuse the saved version)")
+
+    say(f"  inputs: {inputs_json}")
     proc = subprocess.run(
-        [pw, "workflows", "run", str(workflow_yaml),
+        [pw, "workflows", "run", target,
          "-i", inputs_json,
          "--name", f"pwrelay-bootstrap-{int(time.time())}",
          "-o", "text"],
         check=False,
     )
     if proc.returncode != 0:
+        # Common case: first upload hit slug-conflict, but a saved
+        # workflow now exists. Retry by saved name on conflict.
+        if not saved_name:
+            err("workflow run failed (likely slug conflict on first upload).")
+            err("Re-checking saved workflows and retrying by name...")
+            try:
+                ls = subprocess.run(
+                    [pw, "workflows", "ls", "-o", "list"],
+                    capture_output=True, text=True, check=False, timeout=10,
+                )
+                for line in ls.stdout.splitlines():
+                    n = line.strip()
+                    if n in ("auth_relay", "auth-relay", "pw-auth-relay", "authrelay"):
+                        proc = subprocess.run(
+                            [pw, "workflows", "run", n,
+                             "-i", inputs_json,
+                             "--name", f"pwrelay-bootstrap-{int(time.time())}",
+                             "-o", "text"],
+                            check=False,
+                        )
+                        if proc.returncode == 0:
+                            ok(f"bootstrap workflow '{n}' complete (retry)")
+                            return
+                        break
+            except Exception:
+                pass
         err(f"workflow run exited rc={proc.returncode}.")
         err("Bootstrap may have partially succeeded — `pw workflows runs ls` to inspect.")
-        err("Continuing anyway; pass --no-workflow next time to skip this step.")
+        err("Continuing anyway; drop --workflow next time to skip this step.")
     else:
         ok("bootstrap workflow complete")
 
