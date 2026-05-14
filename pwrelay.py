@@ -436,6 +436,55 @@ def _pick_remote_port(resource: str, default: int, label: str) -> int:
     sys.exit(1)
 
 
+def _ensure_desktop_session(resource: str) -> None:
+    """Make sure a running VDI desktop session exists on ``resource``.
+
+    Lists existing sessions via `pw sessions ls -o json`; if none of them
+    have type=desktop AND target matching the resource AND status=running,
+    creates a new one via `pw sessions create --type desktop --wait`.
+    """
+    import json as _json
+    pw = shutil.which("pw")
+    if not pw:
+        err("pw CLI not on PATH — can't manage VDI desktop sessions.")
+        sys.exit(1)
+
+    try:
+        r = subprocess.run(
+            [pw, "sessions", "ls", "-o", "json"],
+            capture_output=True, text=True, check=False, timeout=15,
+        )
+        sessions = _json.loads(r.stdout) if r.stdout.strip() else []
+    except Exception as e:
+        err(f"couldn't list sessions: {e}")
+        sessions = []
+
+    # ACTIVATE returns targetName like 'Matthew.Shaxted/ursa'; the resource
+    # the user passed is just 'ursa'. Match on the suffix after '/'.
+    for s in sessions:
+        if s.get("type") != "desktop":
+            continue
+        if s.get("status") != "running":
+            continue
+        target = (s.get("targetName") or "").rsplit("/", 1)[-1]
+        if target == resource:
+            ok(f"existing desktop session '{s.get('name')}' on {resource} — skipping create")
+            return
+
+    say(f"no running desktop on {resource}; creating one (this typically "
+        "takes 30–60s as the cluster spins up the VNC server) ...")
+    rc = subprocess.run(
+        [pw, "sessions", "create", "--type", "desktop", "--wait", resource],
+        check=False,
+    ).returncode
+    if rc != 0:
+        err(f"desktop create failed (rc={rc}). Continuing — pwrelay will still "
+            "open the tunnels, but Chrome won't have a display to render into "
+            "until you spin a desktop manually.")
+    else:
+        ok(f"desktop session up on {resource}")
+
+
 def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
     """Run the bootstrap workflow on ACTIVATE.
 
@@ -556,6 +605,12 @@ def cmd_up(args: argparse.Namespace) -> None:
     if fido_enabled and not vp.exists():
         err("venv not found. Run: pwrelay setup")
         sys.exit(1)
+
+    # Optional: ensure a VDI desktop exists on the resource. Opt-in
+    # (--desktop) because creating a desktop is a relatively heavy
+    # action and most users start with a desktop already running.
+    if args.desktop:
+        _ensure_desktop_session(resource)
 
     # Optional: run the bootstrap workflow on the remote BEFORE we open
     # tunnels. Opt-in (--workflow) because the remote side is typically
@@ -836,6 +891,13 @@ def build_parser() -> argparse.ArgumentParser:
              "the CAC module). Typically a one-time-per-cluster step; once "
              "the remote side is set up you don't need this flag again. The "
              "--cac flag is propagated to the workflow's enable_cac input.")
+    p_up.add_argument(
+        "--desktop", action="store_true",
+        help="ensure a VDI desktop session exists on the resource. If "
+             "`pw sessions ls` doesn't already show a running desktop on "
+             "this resource, create one via `pw sessions create --type "
+             "desktop`. Use when starting from a clean cluster — saves you "
+             "the trip to the ACTIVATE web UI to spin up a desktop.")
     sub.add_parser("down")
     sub.add_parser("stop")
     sub.add_parser("status")
