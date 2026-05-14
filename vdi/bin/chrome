@@ -183,6 +183,17 @@ ulimit -Sn "$_hardn" 2>/dev/null || true
 #                                       exits in a loop, which has been seen
 #                                       to tear down the DevTools pipe used
 #                                       by install-extension.py.
+# --ssl-version-max=tls1.2
+#   CAC / PIV cards only support PKCS#1 v1.5 signing — their PKCS#11
+#   mechanism list has RSA-PKCS but no RSA-PSS or SHAxx-RSA-PSS. TLS 1.3
+#   *mandates* RSA-PSS for client cert auth; chrome accordingly requests
+#   PSS during the handshake, the relay forwards the request to OpenSC,
+#   and OpenSC returns CKR_MECHANISM_INVALID — surfaced to chrome as
+#   PK11_SignWithMechanism failed: -8152 (SEC_ERROR_INVALID_KEY), with
+#   the user-visible ERR_SSL_CLIENT_AUTH_SIGNATURE_FAILED.
+#   Capping at TLS 1.2 falls back to PKCS#1 v1.5 which the card does
+#   support. The relay-protected pages we care about (NOAA SSO, etc.)
+#   all still accept TLS 1.2.
 exec "$CHROME" \
     --user-data-dir="$PW_CHROME_USER_DATA_DIR" \
     --no-first-run \
@@ -195,4 +206,5 @@ exec "$CHROME" \
     --use-gl=swiftshader \
     --disable-features=Vulkan,OnDeviceModelService,UseChromeOSDirectVideoDecoder,UseSkiaRenderer \
     --renderer-process-limit=4 \
+    --ssl-version-max=tls1.2 \
     "$@" </dev/null >>"$LOG" 2>&1
