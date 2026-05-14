@@ -27,6 +27,40 @@ import os
 import select
 import socket
 import sys
+import time
+
+
+def _open_debug_log() -> "object | None":
+    """Open a debug log file if PWRELAY_BRIDGE_DEBUG is set.
+
+    The env var should point at a file path. Each chunk that flows
+    through the bridge is logged with a timestamp, direction, byte
+    count, and a hex preview of the first 32 bytes — enough to see
+    which RPC message the p11-kit RPC dance is on and whether it was
+    truncated. Multiple bridge spawns append to the same file
+    (line-buffered) so a single chrome sign attempt's full byte flow
+    is visible in one place.
+    """
+    path = os.environ.get("PWRELAY_BRIDGE_DEBUG")
+    if not path:
+        return None
+    try:
+        return open(path, "ab", buffering=0)
+    except OSError as e:
+        print(f"stdio_bridge: couldn't open debug log {path}: {e}",
+              file=sys.stderr)
+        return None
+
+
+def _dlog(f: "object | None", direction: str, buf: bytes) -> None:
+    if f is None:
+        return
+    head = buf[:32].hex()
+    line = f"{time.time():.3f} pid={os.getpid()} {direction} bytes={len(buf)} head={head}\n"
+    try:
+        f.write(line.encode())
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -45,6 +79,10 @@ def main() -> int:
 
     os.set_blocking(stdin_fd, False)
     os.set_blocking(stdout_fd, False)
+
+    dlog = _open_debug_log()
+    _dlog(dlog, "open",
+          f"connect_to={host}:{port}".encode())
 
     stdin_open = True
     sock_open = True
@@ -75,12 +113,14 @@ def main() -> int:
             elif buf == b"":
                 # Real EOF on stdin — half-close the socket's send side.
                 # Don't close recv; p11-kit-server may still drain.
+                _dlog(dlog, "stdin_eof", b"")
                 try:
                     sock.shutdown(socket.SHUT_WR)
                 except OSError:
                     pass
                 stdin_open = False
             else:
+                _dlog(dlog, "stdin->sock", buf)
                 _write_all(sock_fd, buf, is_socket=True, sock=sock)
 
         if sock_fd in r:
@@ -91,8 +131,10 @@ def main() -> int:
             if buf is None:
                 pass  # retry on next select iteration
             elif buf == b"":
+                _dlog(dlog, "sock_eof", b"")
                 sock_open = False
             else:
+                _dlog(dlog, "sock->stdout", buf)
                 _write_all(stdout_fd, buf, is_socket=False)
 
     try: sock.close()
