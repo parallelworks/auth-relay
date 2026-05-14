@@ -516,11 +516,10 @@ def cmd_up(args: argparse.Namespace) -> None:
         err("venv not found. Run: pwrelay setup")
         sys.exit(1)
 
-    # Run the bootstrap workflow on the remote BEFORE we open the tunnels.
-    # On success the VDI has chrome + extension + (optionally) the CAC
-    # PKCS#11 module wired up, so the user's first chrome launch on the
-    # other end Just Works.
-    if not args.no_workflow:
+    # Optional: run the bootstrap workflow on the remote BEFORE we open
+    # tunnels. Opt-in (--workflow) because the remote side is typically
+    # set up once per cluster; subsequent `pwrelay up`s should be fast.
+    if args.workflow:
         _run_bootstrap_workflow(resource, cac_enabled)
 
     rs_user = _resource_user()
@@ -790,12 +789,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the FIDO2 (YubiKey) tunnel entirely. Pair with --cac for "
              "CAC-only operation.")
     p_up.add_argument(
-        "--no-workflow", action="store_true",
-        help="skip running the ACTIVATE bootstrap workflow on the remote. "
-             "By default, pwrelay submits the in-repo workflow.yaml via "
-             "`pw workflows run` so the VDI side (chrome install, extension, "
-             "CAC module) is set up in the same command. Pass this to manage "
-             "the remote side manually.")
+        "--workflow", action="store_true",
+        help="ALSO submit the in-repo workflow.yaml via `pw workflows run` "
+             "to provision the remote (chrome install, extension, optionally "
+             "the CAC module). Typically a one-time-per-cluster step; once "
+             "the remote side is set up you don't need this flag again. The "
+             "--cac flag is propagated to the workflow's enable_cac input.")
     sub.add_parser("down")
     sub.add_parser("stop")
     sub.add_parser("status")
