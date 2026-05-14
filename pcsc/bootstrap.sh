@@ -106,11 +106,31 @@ for cand in \
     break
   fi
 done
+# Fallback: ldconfig (Linux) or `find` under /usr.
 if [[ -z "$P11_KIT_CLIENT" ]]; then
-  err "p11-kit-client.so not found. Install p11-kit:"
-  err "  sudo apt install p11-kit-modules    (Debian/Ubuntu)"
-  err "  sudo dnf install p11-kit            (RHEL/Rocky)"
-  exit 1
+  if command -v ldconfig >/dev/null 2>&1; then
+    P11_KIT_CLIENT=$(ldconfig -p 2>/dev/null | awk '/p11-kit-client\.so/{print $NF; exit}')
+  fi
+fi
+if [[ -z "$P11_KIT_CLIENT" ]]; then
+  P11_KIT_CLIENT=$(find /usr/lib /usr/lib64 -maxdepth 5 -name p11-kit-client.so 2>/dev/null | head -1)
+fi
+
+if [[ -z "$P11_KIT_CLIENT" ]]; then
+  cat >&2 <<'EOF'
+============================================================
+ CAC relay setup SKIPPED — p11-kit-client.so isn't installed
+ on this cluster, so we can't wire chrome up to the laptop
+ CAC. The FIDO/YubiKey relay is unaffected and still works.
+
+ To add CAC support later, ask the cluster admin to install:
+   sudo zypper install p11-kit-server   (SUSE / Gaea)
+   sudo dnf  install p11-kit            (RHEL / Rocky / Ursa)
+   sudo apt  install p11-kit-modules    (Debian / Ubuntu)
+ then re-run this script.
+============================================================
+EOF
+  exit 0    # soft-fail: workflow's other steps stay successful
 fi
 say "found p11-kit-client.so at $P11_KIT_CLIENT"
 
