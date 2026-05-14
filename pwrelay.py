@@ -132,6 +132,17 @@ def _is_running(pid_file: Path) -> bool:
 
 
 def _stop_pid(pid_file: Path, name: str) -> None:
+    """Stop a process group (not just the leader).
+
+    Every pwrelay-spawned process is launched with start_new_session=True
+    (see _detach_kwargs), so each one is the leader of its own process
+    group. Killing the group via os.killpg() catches not only the leader
+    but ALL children, grandchildren, etc., including ones reparented to
+    init after the leader died. This is what fixes the
+    'p11-kit-server / socat survives after agent.sh dies' family of bugs
+    we hit repeatedly: agent.sh's children would orphan and continue
+    running, since killing only the agent.sh pid didn't touch them.
+    """
     pid = _read_pid(pid_file)
     if pid is None:
         return
@@ -140,35 +151,30 @@ def _stop_pid(pid_file: Path, name: str) -> None:
         except FileNotFoundError: pass
         return
     say(f"stopping {name} (pid {pid})")
-    # Try to also catch children (the ssh inside the supervisor loop)
-    kids: list[int] = []
-    if not IS_WIN:
+
+    if IS_WIN:
+        # No process-group equivalent; kill the tree via taskkill /T.
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        # Resolve the process group ID. For start_new_session=True spawns
+        # this equals the pid itself; fall back to pid if getpgid fails.
         try:
-            r = subprocess.run(
-                ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False,
-            )
-            kids = [int(x) for x in r.stdout.split() if x.strip()]
-        except Exception:
-            pass
-    targets = [pid] + kids
-    for p in targets:
-        try:
-            if IS_WIN:
-                subprocess.run(["taskkill", "/PID", str(p), "/F"], check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                os.kill(p, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
-    # Give it a moment to exit, then SIGKILL on POSIX
-    for _ in range(8):
-        if not _is_running(pid_file):
-            break
-        time.sleep(0.25)
-    if not IS_WIN:
-        for p in targets:
-            try: os.kill(p, signal.SIGKILL)
-            except (OSError, ProcessLookupError): pass
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            pgid = pid
+        try: os.killpg(pgid, signal.SIGTERM)
+        except (OSError, ProcessLookupError): pass
+        # Wait for graceful exit
+        for _ in range(8):
+            if not _is_running(pid_file):
+                break
+            time.sleep(0.25)
+        # SIGKILL stragglers
+        try: os.killpg(pgid, signal.SIGKILL)
+        except (OSError, ProcessLookupError): pass
+
     try: pid_file.unlink()
     except FileNotFoundError: pass
 
@@ -982,6 +988,118 @@ def cmd_reset(args: argparse.Namespace) -> None:
     ok("reset complete")
 
 
+def cmd_nuke(args: argparse.Namespace) -> None:
+    """Wipe every pwrelay-adjacent process on the laptop, ignoring state files.
+
+    Use when `down` and `reset` aren't clearing things (stale state files,
+    orphaned p11-kit-server / socat that survived their parent agent.sh,
+    leaked tunnel supervisors from kill -9'd previous runs). Walks
+    /proc-equivalent for every user-owned process and kills any whose
+    executable path or argv matches our binaries.
+
+    Does NOT touch any pw agent — never matches on patterns containing
+    'pw agent' or 'pw ssh'. Optionally cleans the remote too if a
+    resource argument is given (or if PID_RESOURCE is set).
+    """
+    if IS_WIN:
+        err("`pwrelay nuke` isn't implemented on Windows yet — use Task Manager.")
+        sys.exit(1)
+
+    say("nuking pwrelay procs on this laptop (does NOT touch pw agent)")
+
+    # Patterns that uniquely identify our procs in argv. Conservative —
+    # each one is specific enough that no real user process should match.
+    OUR_ARGV_PATTERNS = (
+        str(REPO_ROOT / "laptop" / "agent.py"),
+        str(REPO_ROOT / "pcsc" / "agent.sh"),
+        str(REPO_ROOT / "pcsc" / "stdio_bridge.py"),
+        str(REPO_ROOT / "pwrelay.py"),
+        "name pwrelay-cac --provider",        # p11-kit-server
+        "socat TCP-LISTEN:7777",
+        "socat TCP-LISTEN:7778",
+        "socat TCP-LISTEN:7888",
+        "socat TCP-LISTEN:7889",
+        "tail -F /tmp/pwrelay",
+        "pwrelay-tunnel.log",                 # tunnel supervisor's open() arg
+        "pwrelay-cac-tunnel.log",
+    )
+    # Patterns we MUST NEVER kill — defense in depth.
+    FORBIDDEN = ("pw agent", "pw ssh", " pw-agent")
+
+    me = os.getuid()
+    killed = 0
+    # Use ps to enumerate cmdline so we don't depend on /proc.
+    r = subprocess.run(
+        ["ps", "-ww", "-u", str(me), "-o", "pid=,command="],
+        capture_output=True, text=True, check=False,
+    )
+    self_pid = os.getpid()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid_str, cmd = line.split(None, 1)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        # NEVER touch pw agent
+        if any(f in cmd for f in FORBIDDEN):
+            continue
+        if not any(p in cmd for p in OUR_ARGV_PATTERNS):
+            continue
+        # Kill the whole process group so children orphaned by an earlier
+        # kill -9 of the leader also go.
+        try:
+            pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            pgid = pid
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            killed += 1
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except (OSError, ProcessLookupError):
+                pass
+    say(f"laptop kill count: {killed}")
+
+    # State files
+    state_removed = 0
+    for f in STATE_DIR.glob("pwrelay-*"):
+        try:
+            if f.is_dir():
+                shutil.rmtree(f, ignore_errors=True)
+            else:
+                f.unlink()
+            state_removed += 1
+        except OSError:
+            pass
+    say(f"laptop state files removed: {state_removed}")
+
+    # Remote cleanup (optional)
+    resource = (PID_RESOURCE.read_text().strip() if PID_RESOURCE.exists()
+                else _resolve_resource(args.resource))
+    if resource:
+        say(f"asking {resource} to kill ALL pwrelay-tagged sleeps for this user (NOT pw agent)")
+        subprocess.run(
+            ["pw", "ssh", resource,
+             'for p in $(ps -u "$(id -un)" -o pid,comm 2>/dev/null | awk "$2 == \\"sleep\\" {print $1}"); do '
+             '  cmd=$(tr "\\0" " " < /proc/$p/cmdline 2>/dev/null); '
+             '  echo "$cmd" | grep -q "pwrelay-" && kill -9 "$p" 2>/dev/null; '
+             'done; '
+             'rm -f /tmp/pw-relay-port-$(id -un) 2>/dev/null; '
+             'rm -f $HOME/.config/google-chrome-pwrelay/SingletonLock $HOME/.config/google-chrome-pwrelay/SingletonCookie $HOME/.config/google-chrome-pwrelay/SingletonSocket 2>/dev/null; '
+             'true'],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+    ok("nuke complete")
+
+
 def _print_tail(path: Path, n: int) -> None:
     try:
         lines = path.read_text().splitlines()
@@ -1037,6 +1155,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("resource", nargs="?", default=None)
     p_res = sub.add_parser("reset")
     p_res.add_argument("resource", nargs="?", default=None)
+    p_nuke = sub.add_parser(
+        "nuke",
+        help="wipe every pwrelay-adjacent process on this laptop "
+             "(ignoring state files) and clean the remote too. Use when "
+             "`down` and `reset` leave stragglers behind. Never touches pw agent.")
+    p_nuke.add_argument("resource", nargs="?", default=None)
     return ap
 
 
@@ -1050,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "doctor": cmd_doctor,
         "reset": cmd_reset,
+        "nuke": cmd_nuke,
     }[args.cmd]
     handler(args)
     return 0
