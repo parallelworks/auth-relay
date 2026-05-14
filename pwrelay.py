@@ -436,40 +436,44 @@ def _pick_remote_port(resource: str, default: int, label: str) -> int:
     sys.exit(1)
 
 
-def _ensure_desktop_session(resource: str) -> None:
-    """Make sure a running VDI desktop session exists on ``resource``.
-
-    Lists existing sessions via `pw sessions ls -o json`; if none of them
-    have type=desktop AND target matching the resource AND status=running,
-    creates a new one via `pw sessions create --type desktop --wait`.
-    """
+def _find_desktop_session(resource: str) -> "dict | None":
+    """Return the JSON dict for the user's running desktop on ``resource``,
+    or None if no matching session exists."""
     import json as _json
     pw = shutil.which("pw")
     if not pw:
-        err("pw CLI not on PATH — can't manage VDI desktop sessions.")
-        sys.exit(1)
-
+        return None
     try:
         r = subprocess.run(
             [pw, "sessions", "ls", "-o", "json"],
             capture_output=True, text=True, check=False, timeout=15,
         )
         sessions = _json.loads(r.stdout) if r.stdout.strip() else []
-    except Exception as e:
-        err(f"couldn't list sessions: {e}")
-        sessions = []
-
-    # ACTIVATE returns targetName like 'Matthew.Shaxted/ursa'; the resource
-    # the user passed is just 'ursa'. Match on the suffix after '/'.
+    except Exception:
+        return None
     for s in sessions:
-        if s.get("type") != "desktop":
-            continue
-        if s.get("status") != "running":
-            continue
-        target = (s.get("targetName") or "").rsplit("/", 1)[-1]
-        if target == resource:
-            ok(f"existing desktop session '{s.get('name')}' on {resource} — skipping create")
-            return
+        if s.get("type") == "desktop" and s.get("status") == "running":
+            target = (s.get("targetName") or "").rsplit("/", 1)[-1]
+            if target == resource:
+                return s
+    return None
+
+
+def _ensure_desktop_session(resource: str) -> "dict | None":
+    """Make sure a running VDI desktop session exists on ``resource``.
+
+    Returns the session JSON dict on success (existing or newly created),
+    or None on failure.
+    """
+    pw = shutil.which("pw")
+    if not pw:
+        err("pw CLI not on PATH — can't manage VDI desktop sessions.")
+        sys.exit(1)
+
+    existing = _find_desktop_session(resource)
+    if existing:
+        ok(f"existing desktop session '{existing.get('name')}' on {resource} — skipping create")
+        return existing
 
     say(f"no running desktop on {resource}; creating one (this typically "
         "takes 30–60s as the cluster spins up the VNC server) ...")
@@ -481,8 +485,77 @@ def _ensure_desktop_session(resource: str) -> None:
         err(f"desktop create failed (rc={rc}). Continuing — pwrelay will still "
             "open the tunnels, but Chrome won't have a display to render into "
             "until you spin a desktop manually.")
-    else:
-        ok(f"desktop session up on {resource}")
+        return None
+    ok(f"desktop session up on {resource}")
+    return _find_desktop_session(resource)
+
+
+def _open_vnc_locally(session: dict) -> None:
+    """Port-forward the desktop session and open it in the OS VNC viewer.
+
+    Backgrounds `pw sessions connect <name> --port N` so it survives
+    while pwrelay foregrounds the agent log. Once the proxy port is
+    open, hands `vnc://127.0.0.1:N` to the OS via `open` (macOS),
+    `xdg-open` (Linux), or `start` (Windows).
+    """
+    pw = shutil.which("pw")
+    if not pw:
+        err("pw CLI not on PATH — can't open VNC.")
+        return
+
+    name = session.get("name") or ""
+    namespace = session.get("namespace") or ""
+    full_name = f"{namespace}/{name}" if namespace else name
+    if not full_name:
+        err("desktop session has no name — can't connect.")
+        return
+
+    # Pick a free local port to forward into.
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    local_port = s.getsockname()[1]
+    s.close()
+
+    say(f"port-forwarding desktop session '{full_name}' to 127.0.0.1:{local_port}")
+    connect_log = STATE_DIR / "pwrelay-vnc-connect.log"
+    connect_log.write_text("")
+    proc = subprocess.Popen(
+        [pw, "sessions", "connect", "--port", str(local_port), full_name],
+        stdout=open(connect_log, "ab"), stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        **_detach_kwargs(),
+    )
+    (STATE_DIR / "pwrelay-vnc-connect.pid").write_text(str(proc.pid))
+
+    # Wait briefly for the listener to come up.
+    deadline = time.monotonic() + 12.0
+    listening = False
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.5):
+                listening = True
+                break
+        except OSError:
+            time.sleep(0.4)
+    if not listening:
+        err(f"local VNC proxy didn't come up on port {local_port}. "
+            f"See {connect_log} for `pw sessions connect` output.")
+        return
+    ok(f"local VNC listener ready on 127.0.0.1:{local_port}")
+
+    url = f"vnc://127.0.0.1:{local_port}"
+    say(f"handing {url} to your OS VNC viewer")
+    plat = platform.system()
+    try:
+        if plat == "Darwin":
+            subprocess.Popen(["open", url], close_fds=True)
+        elif plat == "Windows":
+            os.startfile(url)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", url], close_fds=True)
+    except Exception as e:
+        err(f"couldn't auto-open VNC client: {e}")
+        err(f"Open manually: {url}")
 
 
 def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
@@ -609,8 +682,12 @@ def cmd_up(args: argparse.Namespace) -> None:
     # Optional: ensure a VDI desktop exists on the resource. Opt-in
     # (--desktop) because creating a desktop is a relatively heavy
     # action and most users start with a desktop already running.
-    if args.desktop:
-        _ensure_desktop_session(resource)
+    # --open implies --desktop.
+    desktop_session: "dict | None" = None
+    if args.desktop or args.open_vnc:
+        desktop_session = _ensure_desktop_session(resource)
+    if args.open_vnc and desktop_session:
+        _open_vnc_locally(desktop_session)
 
     # Optional: run the bootstrap workflow on the remote BEFORE we open
     # tunnels. Opt-in (--workflow) because the remote side is typically
@@ -898,6 +975,13 @@ def build_parser() -> argparse.ArgumentParser:
              "this resource, create one via `pw sessions create --type "
              "desktop`. Use when starting from a clean cluster — saves you "
              "the trip to the ACTIVATE web UI to spin up a desktop.")
+    p_up.add_argument(
+        "--open", action="store_true", dest="open_vnc",
+        help="after ensuring a desktop session, port-forward it to a local "
+             "VNC port and hand the URL to your OS's default VNC handler "
+             "(macOS Screen Sharing, TightVNC, RealVNC, etc.). Implies "
+             "--desktop. Background-runs `pw sessions connect`; closing "
+             "pwrelay closes the VNC connection too.")
     sub.add_parser("down")
     sub.add_parser("stop")
     sub.add_parser("status")
