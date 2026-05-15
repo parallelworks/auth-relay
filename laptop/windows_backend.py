@@ -78,9 +78,38 @@ def handle_webauthn(req: dict) -> dict:
 
 # ---------- make_credential -------------------------------------------------
 
+def _import_windows_client():
+    """Locate the WindowsClient class across python-fido2 versions.
+
+    python-fido2 has moved WindowsClient's export location more than once:
+      0.x/1.0: fido2.client.WindowsClient
+      1.1+:    fido2.client.windows.WindowsClient (submodule, sometimes
+               not re-exported from the parent)
+      future:  unclear
+    Try in priority order.
+    """
+    last_err = None
+    for path in (
+        ("fido2.client", "WindowsClient"),
+        ("fido2.client.windows", "WindowsClient"),
+        ("fido2.win_api", "WindowsClient"),    # very old name
+    ):
+        try:
+            mod = __import__(path[0], fromlist=[path[1]])
+            return getattr(mod, path[1])
+        except (ImportError, AttributeError) as e:
+            last_err = e
+            continue
+    raise ImportError(
+        f"could not locate WindowsClient in python-fido2; "
+        f"tried fido2.client, fido2.client.windows, fido2.win_api. "
+        f"`pip install --upgrade fido2` may help. Last error: {last_err}"
+    )
+
+
 def _make_credential(wa: dict) -> dict:
     """Call WindowsClient.make_credential and return a PublicKeyCredential dict."""
-    from fido2.client import WindowsClient
+    WindowsClient = _import_windows_client()
     from fido2.webauthn import (
         PublicKeyCredentialCreationOptions,
         PublicKeyCredentialRpEntity,
@@ -178,7 +207,7 @@ def _make_credential(wa: dict) -> dict:
 
 def _get_assertion(wa: dict) -> dict:
     """Call WindowsClient.get_assertion and return a PublicKeyCredential dict."""
-    from fido2.client import WindowsClient
+    WindowsClient = _import_windows_client()
     from fido2.webauthn import (
         PublicKeyCredentialRequestOptions,
         PublicKeyCredentialDescriptor,
