@@ -227,9 +227,30 @@ function nmhCall(req) {
   });
 }
 
-async function relayFrame(ctapCmd, cborBody) {
+async function relayFrame(ctapCmd, cborBody, webauthn) {
+  // Send BOTH the raw CTAP2 frame AND the WebAuthn-level options. The
+  // laptop agent picks based on its platform: Linux/macOS uses the
+  // CTAP2 frame (forwards to a HID YubiKey via python-fido2). Windows
+  // uses the webauthn block (calls fido2.client.WindowsClient, which
+  // doesn't need admin since it goes through webauthn.dll).
+  //
+  // Response shapes:
+  //   - Linux/macOS:  {ok: true, frame: "<b64 ctap2 response>"}
+  //   - Windows:      {ok: true, webauthn: <PublicKeyCredential JSON>}
+  //   - Error:        {ok: false, error: "..."}
+  // The caller (handleCreate / handleGet) checks resp.webauthn first
+  // and uses it verbatim if present; otherwise falls through to the
+  // CTAP2 response decode path.
   const frame = concatBytes(new Uint8Array([ctapCmd]), cborBody);
-  const resp = await nmhCall({ type: "frame", frame: bytesToB64Url(frame) });
+  const resp = await nmhCall({
+    type: "frame",
+    frame: bytesToB64Url(frame),
+    ...(webauthn ? { webauthn } : {}),
+  });
+  if (resp.webauthn) {
+    return { webauthnCredential: resp.webauthn };
+  }
+  if (!resp.frame) throw new Error("relay response missing frame and webauthn");
   const respBytes = b64UrlToBytes(resp.frame);
   if (respBytes.length === 0) throw new Error("empty relay response");
   const status = respBytes[0];
@@ -237,7 +258,7 @@ async function relayFrame(ctapCmd, cborBody) {
   if (status !== 0x00) {
     throw new CtapError(status);
   }
-  return body;
+  return { ctap2Body: body };
 }
 
 class CtapError extends Error {
@@ -308,7 +329,39 @@ async function handleCreate(options, origin) {
   if (excludeList.length > 0) req.set(5, excludeList);
 
   const reqBytes = cborEncode(req);
-  const respBytes = await relayFrame(CTAP2_CMD_MAKE_CREDENTIAL, reqBytes);
+
+  // Bundle the WebAuthn-level options so a Windows laptop can use
+  // WindowsClient instead of the (admin-only) raw HID path.
+  const webauthnOpts = {
+    op: "create",
+    rp: options.rp,
+    user: {
+      id: bytesToB64Url(b64UrlToBytes(options.user.id)),
+      name: options.user.name,
+      displayName: options.user.displayName,
+    },
+    challenge: bytesToB64Url(challenge),
+    origin,
+    pubKeyCredParams: options.pubKeyCredParams,
+    excludeCredentials: (options.excludeCredentials || []).map(d => ({
+      type: d.type, id: d.id, transports: d.transports,
+    })),
+    authenticatorSelection: options.authenticatorSelection,
+    attestation: options.attestation,
+    timeout: options.timeout,
+    extensions: options.extensions,
+  };
+  const relayResult = await relayFrame(CTAP2_CMD_MAKE_CREDENTIAL, reqBytes, webauthnOpts);
+
+  // Windows path: the agent did all the work via WindowsClient; just
+  // return the credential JSON verbatim.
+  if (relayResult.webauthnCredential) {
+    console.log("[pw-relay] make_credential: Windows path response");
+    return relayResult.webauthnCredential;
+  }
+
+  // Linux/macOS path: agent returned a CTAP2 response we need to translate.
+  const respBytes = relayResult.ctap2Body;
   const { value: respMap } = cborDecode(respBytes);
   if (!(respMap instanceof Map)) throw new Error("expected CBOR map in response");
 
@@ -412,7 +465,28 @@ async function handleGet(options, origin) {
   if (allowList.length > 0) req.set(3, allowList);
 
   const reqBytes = cborEncode(req);
-  const respBytes = await relayFrame(CTAP2_CMD_GET_ASSERTION, reqBytes);
+
+  // WebAuthn-level options for the Windows-laptop path (see relayFrame).
+  const webauthnOpts = {
+    op: "get",
+    rpId,
+    challenge: bytesToB64Url(challenge),
+    origin,
+    allowCredentials: (options.allowCredentials || []).map(d => ({
+      type: d.type, id: d.id, transports: d.transports,
+    })),
+    userVerification: options.userVerification,
+    timeout: options.timeout,
+    extensions: options.extensions,
+  };
+  const relayResult = await relayFrame(CTAP2_CMD_GET_ASSERTION, reqBytes, webauthnOpts);
+
+  if (relayResult.webauthnCredential) {
+    console.log("[pw-relay] get_assertion: Windows path response");
+    return relayResult.webauthnCredential;
+  }
+
+  const respBytes = relayResult.ctap2Body;
   const { value: respMap } = cborDecode(respBytes);
   if (!(respMap instanceof Map)) throw new Error("expected CBOR map in assertion response");
 

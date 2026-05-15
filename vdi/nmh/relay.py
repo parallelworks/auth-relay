@@ -134,6 +134,41 @@ def main() -> int:
                     continue
                 if kind != "frame":
                     raise ValueError(f"unknown type: {kind!r}")
+
+                # If the extension included a 'webauthn' field, we forward
+                # the WHOLE request as a JSON envelope so the laptop agent
+                # (on Windows) can hand the high-level options to
+                # WindowsClient instead of doing raw HID. Linux/macOS
+                # agents will respond with an error if they receive a JSON
+                # envelope; on those platforms the extension's CTAP2
+                # frame is sufficient and the agent uses that path.
+                webauthn = req.get("webauthn")
+                if webauthn:
+                    # Pass through as JSON bytes; the agent's first-byte
+                    # dispatch ('{' == 0x7B) routes to its JSON handler.
+                    envelope = json.dumps({
+                        "id": req_id,
+                        "type": "frame",
+                        "webauthn": webauthn,
+                    }).encode("utf-8")
+                    if sock is None:
+                        port = _read_port_hint()
+                        sock = socket.create_connection((RELAY_HOST, port), timeout=10)
+                        sock.settimeout(RECV_TIMEOUT_S)
+                        log(f"connected to relay (local={sock.getsockname()} port={port})")
+                    resp_bytes = relay_call(sock, envelope)
+                    # Response is JSON bytes too.
+                    try:
+                        resp_obj = json.loads(resp_bytes.decode("utf-8"))
+                    except Exception as e:
+                        raise ValueError(f"bad JSON response from agent: {e}; raw={resp_bytes[:200]!r}")
+                    # Forward verbatim — the extension knows how to
+                    # consume {ok, webauthn} or {ok, error}.
+                    resp_obj.setdefault("id", req_id)
+                    write_chrome_message(resp_obj)
+                    continue
+
+                # Legacy CTAP2 path (Linux/macOS laptop):
                 frame_b64 = req.get("frame")
                 if not isinstance(frame_b64, str):
                     raise ValueError("frame must be a base64 string")
