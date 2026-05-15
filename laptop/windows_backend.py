@@ -78,6 +78,41 @@ def handle_webauthn(req: dict) -> dict:
 
 # ---------- make_credential -------------------------------------------------
 
+def _make_windows_client(WindowsClient, origin: str):
+    """Instantiate WindowsClient across python-fido2 versions.
+
+    Different python-fido2 releases changed the constructor signature:
+      1.0:   WindowsClient(origin)                  # positional
+      1.1+:  WindowsClient(origin: str, *, ...)     # positional or kwarg
+      some:  WindowsClient(verify_origin, ...)       # different param name
+    Try positional first (works everywhere), kwarg next, then a few
+    alternative names. If all fail, raise a clear error with the actual
+    constructor signature for the user to send back.
+    """
+    import inspect
+    # Most-compatible: positional.
+    try:
+        return WindowsClient(origin)
+    except TypeError:
+        pass
+    # Some old builds took named keyword.
+    for kw in ("origin", "verify_origin", "rp_id"):
+        try:
+            return WindowsClient(**{kw: origin})
+        except TypeError:
+            continue
+    # Give up — surface the signature so we can extend the fallbacks.
+    try:
+        sig = inspect.signature(WindowsClient)
+    except Exception:
+        sig = "<unknown>"
+    raise TypeError(
+        f"can't instantiate WindowsClient; tried positional, origin=, "
+        f"verify_origin=, rp_id=. Signature: {sig}. "
+        f"Send this signature back to extend the fallbacks."
+    )
+
+
 def _import_windows_client():
     """Locate the WindowsClient class across python-fido2 versions.
 
@@ -154,7 +189,7 @@ def _make_credential(wa: dict) -> dict:
         attestation=_attestation_pref(wa.get("attestation", "none")),
     )
 
-    client = WindowsClient(origin=wa["origin"])
+    client = _make_windows_client(WindowsClient, wa["origin"])
     LOG.info("WindowsClient.make_credential: rp=%s user=%s", rp.get("id"), user.get("name"))
     response = client.make_credential(options)
 
@@ -230,7 +265,7 @@ def _get_assertion(wa: dict) -> dict:
         user_verification=_uv_requirement(wa.get("userVerification")),
     )
 
-    client = WindowsClient(origin=wa["origin"])
+    client = _make_windows_client(WindowsClient, wa["origin"])
     LOG.info("WindowsClient.get_assertion: rpId=%s", wa.get("rpId"))
     response = client.get_assertion(options)
 
