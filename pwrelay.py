@@ -210,8 +210,21 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
     pwcli_key = HOME / ".ssh" / "pwcli"
     if not pwcli_key.exists():
-        err(f"{pwcli_key} missing. Run: pw auth login")
-        sys.exit(1)
+        # The ~/.ssh/pwcli key is created lazily — only the first time
+        # the user runs `pw ssh`, not when they `pw auth login`. Trigger
+        # creation by invoking a no-op `pw ssh` against the workspace.
+        # The remote command exits immediately so this is fast and
+        # never opens a real shell.
+        say(f"{pwcli_key} missing — triggering creation via `pw ssh workspace true`")
+        subprocess.run(
+            ["pw", "ssh", "workspace", "true"],
+            check=False, capture_output=True, timeout=30,
+        )
+        if not pwcli_key.exists():
+            err(f"{pwcli_key} still missing after `pw ssh workspace true`.")
+            err("Manually run `pw ssh workspace` once to trigger key setup, then re-run setup.")
+            sys.exit(1)
+        ok(f"created {pwcli_key}")
 
     venv = REPO_ROOT / ".venv"
     if not venv.exists():
