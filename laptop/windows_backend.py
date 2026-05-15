@@ -78,6 +78,43 @@ def handle_webauthn(req: dict) -> dict:
 
 # ---------- make_credential -------------------------------------------------
 
+def _unwrap_registration_response(r):
+    """Return the inner AuthenticatorAttestationResponse-like object.
+
+    python-fido2 1.1+ returns a RegistrationResponse that wraps the
+    AuthenticatorAttestationResponse in a .response attribute. Older
+    versions return the inner directly. Walk one level if needed.
+    """
+    if hasattr(r, "attestation_object"):
+        return r
+    if hasattr(r, "response") and hasattr(r.response, "attestation_object"):
+        return r.response
+    raise AttributeError(
+        f"make_credential returned an unrecognized shape: {type(r).__name__}; "
+        f"attrs={[a for a in dir(r) if not a.startswith('_')]}"
+    )
+
+
+def _unwrap_assertion_response(r):
+    """Return a single AuthenticatorAssertionResponse-like object."""
+    # AssertionSelection: contains multiple choices, .get_response(idx) picks one.
+    if hasattr(r, "get_response"):
+        try:
+            return r.get_response(0)
+        except Exception:
+            pass
+    # AuthenticationResponse wrapper (1.1+)
+    if hasattr(r, "response") and hasattr(r.response, "authenticator_data"):
+        return r.response
+    # Direct AuthenticatorAssertionResponse
+    if hasattr(r, "authenticator_data"):
+        return r
+    raise AttributeError(
+        f"get_assertion returned an unrecognized shape: {type(r).__name__}; "
+        f"attrs={[a for a in dir(r) if not a.startswith('_')]}"
+    )
+
+
 def _make_windows_client(WindowsClient, origin: str):
     """Instantiate WindowsClient across python-fido2 versions.
 
@@ -225,9 +262,14 @@ def _make_credential(wa: dict) -> dict:
 
     client = _make_windows_client(WindowsClient, wa["origin"])
     LOG.info("WindowsClient.make_credential: rp=%s user=%s", rp.get("id"), user.get("name"))
-    response = client.make_credential(options)
+    raw_response = client.make_credential(options)
 
-    # response is an AuthenticatorAttestationResponse-like object.
+    # python-fido2 response shapes vary by version:
+    #   1.0:    AuthenticatorAttestationResponse (has .attestation_object, .client_data)
+    #   1.1+:   RegistrationResponse (wraps: .response.attestation_object, .response.client_data)
+    # Unwrap the outer container if present.
+    response = _unwrap_registration_response(raw_response)
+
     attestation_obj = bytes(response.attestation_object)
     client_data = bytes(response.client_data)
     auth_data = response.attestation_object.auth_data
@@ -301,20 +343,21 @@ def _get_assertion(wa: dict) -> dict:
 
     client = _make_windows_client(WindowsClient, wa["origin"])
     LOG.info("WindowsClient.get_assertion: rpId=%s", wa.get("rpId"))
-    response = client.get_assertion(options)
+    raw_response = client.get_assertion(options)
 
-    # AuthenticatorAssertionResponse-like; some python-fido2 versions
-    # return a list of assertion choices — we take the first.
-    if hasattr(response, "get_response"):
-        # Newer python-fido2: AssertionSelection.get_response(0)
-        first = response.get_response(0)
-    else:
-        first = response
+    # python-fido2 response shapes vary:
+    #   1.0:    AuthenticatorAssertionResponse directly
+    #   1.0+:   AssertionSelection with .get_response(0)
+    #   1.1+:   AuthenticationResponse wrapper containing .response or similar
+    first = _unwrap_assertion_response(raw_response)
 
     client_data = bytes(first.client_data)
     auth_data = bytes(first.authenticator_data)
     sig = bytes(first.signature)
-    cred_id = first.credential_id
+    cred_id = getattr(first, "credential_id", None) or getattr(first, "credential", None)
+    # If credential_id is on the wrapper, not the response, try the parent.
+    if cred_id is None and hasattr(raw_response, "raw_id"):
+        cred_id = raw_response.raw_id
 
     out = {
         "id": _b64url_encode(cred_id) if cred_id else None,
