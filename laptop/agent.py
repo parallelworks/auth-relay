@@ -28,11 +28,15 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import socket
 import sys
 import threading
 import time
 from pathlib import Path
+
+# Make laptop/windows_backend importable when this script is invoked directly.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.protocol import recv_frame, send_frame
@@ -111,6 +115,9 @@ class DeviceManager:
                 return dev.call(CTAPHID.CBOR, frame)
 
 
+IS_WIN = platform.system() == "Windows"
+
+
 def serve_one(client: socket.socket, addr: tuple, devices: DeviceManager) -> None:
     peer = f"{addr[0]}:{addr[1]}"
     LOG.info("connection from %s", peer)
@@ -124,26 +131,86 @@ def serve_one(client: socket.socket, addr: tuple, devices: DeviceManager) -> Non
                 if not frame:
                     LOG.warning("%s sent empty frame; ignoring", peer)
                     continue
-                ctap2_cmd = frame[0]
-                t0 = time.perf_counter()
-                LOG.info("%s -> ctap2_cmd=0x%02x len=%d", peer, ctap2_cmd, len(frame))
-                try:
-                    response = devices.call_cbor(frame)
-                except CtapError as exc:
-                    # Authenticator-level error — forward the real status
-                    # byte so the extension/RP sees what the device said
-                    # (e.g., 0x2E = NO_CREDENTIALS, 0x36 = USER_ACTION_TIMEOUT).
-                    response = bytes([exc.code])
-                    LOG.warning("%s ctap error 0x%02x: %s", peer, exc.code, exc)
-                except Exception as exc:
-                    LOG.error("%s device.call hard failure: %r", peer, exc)
-                    response = bytes([CTAP_ERR_OTHER])
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                status = response[0] if response else 0xFF
-                LOG.info("%s <- status=0x%02x len=%d dt=%.1fms", peer, status, len(response), dt_ms)
+
+                # Dispatch by first byte: '{' (0x7B) -> JSON envelope (used
+                # by the Windows non-admin path, which needs WebAuthn-level
+                # options not just a CTAP2 frame). Anything else -> raw
+                # CTAP2 (Linux/macOS, the existing path).
+                if frame[0] == 0x7B:  # '{'
+                    response = _serve_json(frame, peer, devices)
+                else:
+                    response = _serve_raw(frame, devices, peer)
                 send_frame(client, response)
     except (ConnectionError, OSError) as exc:
         LOG.warning("%s aborted: %s", peer, exc)
+
+
+def _serve_raw(frame: bytes, devices: DeviceManager, peer: str) -> bytes:
+    """Existing path: forward a CTAP2 CBOR frame to a local HID YubiKey."""
+    ctap2_cmd = frame[0]
+    t0 = time.perf_counter()
+    LOG.info("%s -> ctap2_cmd=0x%02x len=%d", peer, ctap2_cmd, len(frame))
+    try:
+        response = devices.call_cbor(frame)
+    except CtapError as exc:
+        response = bytes([exc.code])
+        LOG.warning("%s ctap error 0x%02x: %s", peer, exc.code, exc)
+    except Exception as exc:
+        LOG.error("%s device.call hard failure: %r", peer, exc)
+        response = bytes([CTAP_ERR_OTHER])
+    dt_ms = (time.perf_counter() - t0) * 1000.0
+    status = response[0] if response else 0xFF
+    LOG.info("%s <- status=0x%02x len=%d dt=%.1fms", peer, status, len(response), dt_ms)
+    return response
+
+
+def _serve_json(frame: bytes, peer: str, devices: DeviceManager) -> bytes:
+    """Handle a JSON envelope.
+
+    The extension always sends both an embedded CTAP2 'frame' (used on
+    Linux/macOS where we forward to a HID YubiKey) AND a 'webauthn'
+    block of WebAuthn-level options (used on Windows where webauthn.dll
+    has the HID reserved). The agent picks based on its own platform.
+
+    Response wire is also JSON. Linux/macOS returns
+        {ok, frame: "<b64 ctap2 response>"}
+    Windows returns
+        {ok, webauthn: <PublicKeyCredential JSON>}
+    The NMH forwards the response verbatim to the extension, which knows
+    how to consume either shape.
+    """
+    import base64 as _b64
+    import json as _json
+    t0 = time.perf_counter()
+    try:
+        req = _json.loads(frame.decode("utf-8"))
+    except Exception as exc:
+        LOG.error("%s bad JSON envelope: %r", peer, exc)
+        return _json.dumps({"ok": False, "error": f"bad JSON: {exc}"}).encode()
+
+    req_id = req.get("id")
+
+    if IS_WIN:
+        op = (req.get("webauthn") or {}).get("op", "?")
+        LOG.info("%s -> webauthn op=%s (Windows path)", peer, op)
+        from windows_backend import handle_webauthn
+        out = handle_webauthn(req)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        LOG.info("%s <- webauthn ok=%s dt=%.1fms", peer, out.get("ok"), dt_ms)
+        return _json.dumps(out).encode()
+
+    # Linux/macOS: pull the embedded CTAP2 frame and forward to HID.
+    frame_b64 = req.get("frame")
+    if not frame_b64:
+        return _json.dumps({"id": req_id, "ok": False,
+            "error": "envelope has no 'frame' field; agent is not Windows"}).encode()
+    padded = frame_b64 + "=" * (-len(frame_b64) % 4)
+    ctap2 = _b64.urlsafe_b64decode(padded.replace("-", "+").replace("_", "/"))
+    resp = _serve_raw(ctap2, devices, peer)
+    return _json.dumps({
+        "id": req_id, "ok": True,
+        "frame": _b64.b64encode(resp).decode("ascii"),
+    }).encode()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -156,8 +223,15 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
     devices = DeviceManager()
-    # Open eagerly so the user sees the YubiKey is detected at startup.
-    devices._ensure_open()  # noqa: SLF001 — internal use, fine here
+    # On Linux/macOS, open eagerly so the user sees the YubiKey is
+    # detected at startup. On Windows we deliberately skip this — the
+    # raw HID open requires admin (webauthn.dll has the device
+    # reserved), and we serve everything via the JSON-envelope path
+    # which calls fido2.client.WindowsClient instead.
+    if not IS_WIN:
+        devices._ensure_open()  # noqa: SLF001 — internal use, fine here
+    else:
+        LOG.info("Windows detected — skipping HID open; using WindowsClient backend")
 
     # Intentionally loopback-only. The only sanctioned path from a remote PW
     # session to this agent is the pw ssh -R reverse tunnel, which terminates
