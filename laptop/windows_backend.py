@@ -144,20 +144,68 @@ def _unwrap_registration_response(r):
     )
 
 
+def _find_credential_id(r) -> "bytes | None":
+    """Walk a python-fido2 assertion result and return the credentialId bytes.
+
+    On 1.1+ the AuthenticationResponse wrapper carries raw_id; on
+    AssertionSelection the wrapper's get_response(0) reaches it. Walk
+    the wrappers and check any attribute named raw_id / credential_id /
+    credential along the way.
+    """
+    seen = set()
+    while r is not None and id(r) not in seen:
+        seen.add(id(r))
+        for attr in ("raw_id", "credential_id", "credential"):
+            v = getattr(r, attr, None)
+            if isinstance(v, (bytes, bytearray)) and v:
+                return bytes(v)
+            # PublicKeyCredentialDescriptor with .id
+            if v is not None and hasattr(v, "id"):
+                vid = getattr(v, "id", None)
+                if isinstance(vid, (bytes, bytearray)) and vid:
+                    return bytes(vid)
+        # Walk one more level.
+        if hasattr(r, "get_response"):
+            try:
+                r = r.get_response(0)
+                continue
+            except Exception:
+                pass
+        r = getattr(r, "response", None)
+    return None
+
+
 def _unwrap_assertion_response(r):
-    """Return a single AuthenticatorAssertionResponse-like object."""
-    # AssertionSelection: contains multiple choices, .get_response(idx) picks one.
-    if hasattr(r, "get_response"):
-        try:
-            return r.get_response(0)
-        except Exception:
-            pass
-    # AuthenticationResponse wrapper (1.1+)
-    if hasattr(r, "response") and hasattr(r.response, "authenticator_data"):
-        return r.response
-    # Direct AuthenticatorAssertionResponse
-    if hasattr(r, "authenticator_data"):
-        return r
+    """Walk through wrapper layers to find an object that has both
+    ``authenticator_data`` and ``client_data`` directly.
+
+    python-fido2's API has TWO layers of wrappers as of 1.1:
+        AssertionSelection.get_response(0) -> AuthenticationResponse
+        AuthenticationResponse.response   -> AuthenticatorAssertionResponse
+    We need to peel both off. Walk iteratively until the attributes we
+    need are directly present (or give up with a clear error).
+    """
+    seen = set()
+    while True:
+        if id(r) in seen:
+            break
+        seen.add(id(r))
+        # The shape we want — used directly by the caller.
+        if hasattr(r, "authenticator_data") and hasattr(r, "client_data"):
+            return r
+        # AssertionSelection-style: pick the first choice.
+        if hasattr(r, "get_response"):
+            try:
+                r = r.get_response(0)
+                continue
+            except Exception:
+                pass
+        # Generic wrapper: peel `.response`.
+        inner = getattr(r, "response", None)
+        if inner is not None and inner is not r:
+            r = inner
+            continue
+        break
     raise AttributeError(
         f"get_assertion returned an unrecognized shape: {type(r).__name__}; "
         f"attrs={[a for a in dir(r) if not a.startswith('_')]}"
@@ -383,19 +431,23 @@ def _get_assertion(wa: dict) -> dict:
     LOG.info("WindowsClient.get_assertion: rpId=%s", wa.get("rpId"))
     raw_response = client.get_assertion(options)
 
-    # python-fido2 response shapes vary:
-    #   1.0:    AuthenticatorAssertionResponse directly
-    #   1.0+:   AssertionSelection with .get_response(0)
-    #   1.1+:   AuthenticationResponse wrapper containing .response or similar
-    first = _unwrap_assertion_response(raw_response)
+    # python-fido2 response shapes vary (1.1+ has two nested wrappers):
+    #   AssertionSelection.get_response(0) -> AuthenticationResponse
+    #   AuthenticationResponse.response    -> AuthenticatorAssertionResponse
+    inner = _unwrap_assertion_response(raw_response)
 
-    client_data = bytes(first.client_data)
-    auth_data = bytes(first.authenticator_data)
-    sig = bytes(first.signature)
-    cred_id = getattr(first, "credential_id", None) or getattr(first, "credential", None)
-    # If credential_id is on the wrapper, not the response, try the parent.
-    if cred_id is None and hasattr(raw_response, "raw_id"):
-        cred_id = raw_response.raw_id
+    client_data = bytes(inner.client_data)
+    auth_data = bytes(inner.authenticator_data)
+    sig = bytes(inner.signature)
+
+    # credential_id may live on any of: the inner, the intermediate
+    # AuthenticationResponse (as raw_id / id), or the AssertionSelection.
+    # Try all of them.
+    cred_id = (
+        getattr(inner, "credential_id", None)
+        or getattr(inner, "credential", None)
+        or _find_credential_id(raw_response)
+    )
 
     out = {
         "id": _b64url_encode(cred_id) if cred_id else None,
