@@ -81,36 +81,70 @@ def handle_webauthn(req: dict) -> dict:
 def _make_windows_client(WindowsClient, origin: str):
     """Instantiate WindowsClient across python-fido2 versions.
 
-    Different python-fido2 releases changed the constructor signature:
-      1.0:   WindowsClient(origin)                  # positional
-      1.1+:  WindowsClient(origin: str, *, ...)     # positional or kwarg
-      some:  WindowsClient(verify_origin, ...)       # different param name
-    Try positional first (works everywhere), kwarg next, then a few
-    alternative names. If all fail, raise a clear error with the actual
-    constructor signature for the user to send back.
+    python-fido2 reshuffled this API across releases:
+      0.9/1.0:  WindowsClient(origin: str)
+      1.1+:     WindowsClient(client_data_collector, ...)
+                where client_data_collector is a DefaultClientDataCollector
+                (or similar) constructed from origin. Passing a str directly
+                stores it as the collector; later `client.make_credential(...)`
+                calls `collector.collect_client_data(...)` which explodes on
+                a string with AttributeError.
+
+    Strategy: try the NEW API first (wrap origin in DefaultClientDataCollector).
+    Fall back to the OLD API (positional str) if the wrapper class isn't
+    available — that's the 1.0-era path.
     """
     import inspect
-    # Most-compatible: positional.
+
+    # NEW API: WindowsClient(DefaultClientDataCollector(origin))
+    Collector = _import_client_data_collector()
+    if Collector is not None:
+        try:
+            return WindowsClient(Collector(origin))
+        except TypeError:
+            pass
+        # Some 1.x builds want the collector as keyword.
+        for kw in ("client_data_collector", "collector"):
+            try:
+                return WindowsClient(**{kw: Collector(origin)})
+            except TypeError:
+                continue
+
+    # OLD API: WindowsClient(origin)
     try:
         return WindowsClient(origin)
     except TypeError:
         pass
-    # Some old builds took named keyword.
     for kw in ("origin", "verify_origin", "rp_id"):
         try:
             return WindowsClient(**{kw: origin})
         except TypeError:
             continue
-    # Give up — surface the signature so we can extend the fallbacks.
+
     try:
         sig = inspect.signature(WindowsClient)
     except Exception:
         sig = "<unknown>"
     raise TypeError(
-        f"can't instantiate WindowsClient; tried positional, origin=, "
-        f"verify_origin=, rp_id=. Signature: {sig}. "
-        f"Send this signature back to extend the fallbacks."
+        f"can't instantiate WindowsClient. Tried new-API "
+        f"(DefaultClientDataCollector wrapper) and old-API (str origin). "
+        f"Signature: {sig}. Send this back to extend the fallbacks."
     )
+
+
+def _import_client_data_collector():
+    """Return DefaultClientDataCollector class, or None if not available."""
+    for path in (
+        ("fido2.client", "DefaultClientDataCollector"),
+        ("fido2.client._client_data_collector", "DefaultClientDataCollector"),
+        ("fido2.client.client_data_collector", "DefaultClientDataCollector"),
+    ):
+        try:
+            mod = __import__(path[0], fromlist=[path[1]])
+            return getattr(mod, path[1])
+        except (ImportError, AttributeError):
+            continue
+    return None
 
 
 def _import_windows_client():
