@@ -461,7 +461,7 @@ def _get_assertion(wa: dict) -> dict:
         },
         "clientExtensionResults": {},
     }
-    user_handle = getattr(first, "user_handle", None)
+    user_handle = getattr(inner, "user_handle", None)
     if user_handle:
         out["response"]["userHandle"] = _b64url_encode(bytes(user_handle))
     return out
