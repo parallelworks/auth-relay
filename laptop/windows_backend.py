@@ -78,6 +78,55 @@ def handle_webauthn(req: dict) -> dict:
 
 # ---------- make_credential -------------------------------------------------
 
+def _cose_to_spki(cose) -> bytes:
+    """Convert a COSE_Key (python-fido2 CoseKey or dict-like) to SPKI DER.
+
+    Chrome 148+ requires the SPKI bytes in the WebAuthn proxy response's
+    `publicKey` field. python-fido2 has a few API paths to get there;
+    fall back to manual SPKI construction for ES256 (P-256), which is
+    what almost every YubiKey ships out of the box.
+    """
+    # Path 1: CoseKey.public_bytes() helper (some versions)
+    if hasattr(cose, "public_bytes"):
+        try:
+            b = cose.public_bytes()
+            if b:
+                return b
+        except Exception:
+            pass
+    # Path 2: CoseKey -> cryptography public_key -> SPKI DER
+    try:
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding, PublicFormat,
+        )
+        pk_attr = getattr(cose, "public_key", None)
+        pk = pk_attr() if callable(pk_attr) else pk_attr
+        if pk is not None and hasattr(pk, "public_bytes"):
+            return pk.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+    except Exception:
+        pass
+    # Path 3: Manual SPKI assembly for ES256 / P-256 (RFC 5480).
+    # COSE_Key fields per RFC 8152: 1=kty, 3=alg, -1=crv, -2=x, -3=y
+    try:
+        getf = (lambda k: cose.get(k)) if hasattr(cose, "get") else (lambda k: cose[k])
+        kty = getf(1)
+        alg = getf(3)
+        if kty == 2 and alg == -7:  # EC2, ES256
+            crv = getf(-1)
+            x = getf(-2)
+            y = getf(-3)
+            if crv == 1 and isinstance(x, (bytes, bytearray)) and isinstance(y, (bytes, bytearray)):
+                if len(x) == 32 and len(y) == 32:
+                    # SPKI prefix for P-256 + uncompressed point (0x04 || x || y)
+                    spki_prefix = bytes.fromhex(
+                        "3059301306072a8648ce3d020106082a8648ce3d030107034200"
+                    )
+                    return spki_prefix + b"\x04" + bytes(x) + bytes(y)
+    except Exception:
+        pass
+    return b""
+
+
 def _unwrap_registration_response(r):
     """Return the inner AuthenticatorAttestationResponse-like object.
 
@@ -281,21 +330,10 @@ def _make_credential(wa: dict) -> dict:
     pub_key_alg = 0
     try:
         cose = auth_data.credential_data.public_key
-        pub_key_alg = int(cose.ALGORITHM) if hasattr(cose, "ALGORITHM") else int(cose[3])
-        # CoseKey has a .public_bytes() helper on newer python-fido2; older
-        # versions: convert via cryptography.
-        if hasattr(cose, "public_bytes"):
-            pub_key_spki = cose.public_bytes()
-        else:
-            from cryptography.hazmat.primitives.serialization import (
-                Encoding, PublicFormat,
-            )
-            crypto_pub = cose.public_key() if hasattr(cose, "public_key") else None
-            if crypto_pub is not None:
-                pub_key_spki = crypto_pub.public_bytes(
-                    Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
+        pub_key_alg = int(cose.get(3) if hasattr(cose, "get") else cose[3])
+        pub_key_spki = _cose_to_spki(cose)
     except Exception as e:
-        LOG.warning("could not derive publicKey SPKI: %r", e)
+        LOG.warning("could not derive publicKey SPKI from COSE key: %r", e)
 
     return {
         "id": _b64url_encode(credential_id),
