@@ -661,7 +661,7 @@ def _run_bootstrap_workflow(resource: str, cac_enabled: bool) -> None:
 
     err(f"all bootstrap workflow paths failed (last rc={rc}).")
     err(f"Inspect via: pw workflows runs ls")
-    err("Continuing anyway; drop --workflow next time to skip this step.")
+    err("Continuing anyway; drop --bootstrap next time to skip this step.")
 
 
 def _clear_stale_local_state() -> None:
@@ -744,10 +744,11 @@ def cmd_up(args: argparse.Namespace) -> None:
     if args.open_vnc and desktop_session:
         _open_vnc_locally(desktop_session)
 
-    # Optional: run the bootstrap workflow on the remote BEFORE we open
-    # tunnels. Opt-in (--workflow) because the remote side is typically
-    # set up once per cluster; subsequent `pwrelay up`s should be fast.
-    if args.workflow:
+    # Optional: bootstrap the remote side BEFORE we open tunnels.
+    # Opt-in (--bootstrap, was --workflow) because the remote side is
+    # typically set up once per cluster; subsequent `pwrelay up`s
+    # should be fast.
+    if args.bootstrap:
         _run_bootstrap_workflow(resource, cac_enabled)
 
     rs_user = _resource_user()
@@ -1129,12 +1130,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the FIDO2 (YubiKey) tunnel entirely. Pair with --cac for "
              "CAC-only operation.")
     p_up.add_argument(
-        "--workflow", action="store_true",
-        help="ALSO submit the in-repo workflow.yaml via `pw workflows run` "
-             "to provision the remote (chrome install, extension, optionally "
-             "the CAC module). Typically a one-time-per-cluster step; once "
-             "the remote side is set up you don't need this flag again. The "
-             "--cac flag is propagated to the workflow's enable_cac input.")
+        "--bootstrap", "--workflow",
+        action="store_true", dest="bootstrap",
+        help="ALSO bootstrap the remote side — runs the auth-relay workflow "
+             "via `pw workflows run` to install portable Chrome, register "
+             "the extension, and (with --cac) the CAC module on the cluster. "
+             "Typically a one-time-per-cluster step; once the remote side is "
+             "set up you don't need this flag again. The --cac flag is "
+             "propagated to the workflow's enable_cac input. "
+             "(--workflow is the deprecated alias.)")
     p_up.add_argument(
         "--desktop", action="store_true",
         help="ensure a VDI desktop session exists on the resource. If "
