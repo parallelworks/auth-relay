@@ -212,48 +212,86 @@ def _unwrap_assertion_response(r):
     )
 
 
+def _get_foreground_hwnd():
+    """Resolve a usable HWND for webauthn.dll's UI parent.
+
+    WebAuthNAuthenticatorMakeCredential refuses to operate on
+    HWND = NULL (returns E_ACCESSDENIED, WinError -2147417829). We
+    need to hand it a window handle to be the parent of its dialog.
+
+    Try in order:
+      1. user32.GetForegroundWindow()  — whatever window the user is
+         currently looking at (usually their browser in the VDI, but
+         on Windows the foreground is on the laptop side; this is
+         the right semantic for webauthn.dll)
+      2. kernel32.GetConsoleWindow()    — our own console
+    Either gives webauthn.dll a non-NULL hWnd to attach its prompt to.
+    """
+    import ctypes
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        if hwnd:
+            return hwnd
+    except Exception:
+        pass
+    try:
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            return hwnd
+    except Exception:
+        pass
+    return 0
+
+
 def _make_windows_client(WindowsClient, origin: str):
     """Instantiate WindowsClient across python-fido2 versions.
 
     python-fido2 reshuffled this API across releases:
-      0.9/1.0:  WindowsClient(origin: str)
-      1.1+:     WindowsClient(client_data_collector, ...)
-                where client_data_collector is a DefaultClientDataCollector
-                (or similar) constructed from origin. Passing a str directly
-                stores it as the collector; later `client.make_credential(...)`
-                calls `collector.collect_client_data(...)` which explodes on
-                a string with AttributeError.
+      0.9/1.0:  WindowsClient(origin: str, handle=None)
+      1.1+:     WindowsClient(client_data_collector, handle=None, ...)
 
-    Strategy: try the NEW API first (wrap origin in DefaultClientDataCollector).
-    Fall back to the OLD API (positional str) if the wrapper class isn't
-    available — that's the 1.0-era path.
+    Crucially we MUST pass a non-NULL window handle (HWND), or
+    WebAuthNAuthenticatorMakeCredential returns E_ACCESSDENIED.
+    Some python-fido2 builds default to GetForegroundWindow but
+    others pass NULL — pass explicitly to be safe.
     """
     import inspect
+    hwnd = _get_foreground_hwnd()
 
-    # NEW API: WindowsClient(DefaultClientDataCollector(origin))
     Collector = _import_client_data_collector()
+
+    # NEW API: WindowsClient(DefaultClientDataCollector(origin), handle=hwnd)
     if Collector is not None:
-        try:
-            return WindowsClient(Collector(origin))
-        except TypeError:
-            pass
-        # Some 1.x builds want the collector as keyword.
-        for kw in ("client_data_collector", "collector"):
+        for attempt in (
+            lambda: WindowsClient(Collector(origin), handle=hwnd),
+            lambda: WindowsClient(Collector(origin), hwnd),
+            lambda: WindowsClient(Collector(origin)),
+            lambda: WindowsClient(client_data_collector=Collector(origin), handle=hwnd),
+            lambda: WindowsClient(collector=Collector(origin), handle=hwnd),
+        ):
             try:
-                return WindowsClient(**{kw: Collector(origin)})
+                return attempt()
             except TypeError:
                 continue
 
-    # OLD API: WindowsClient(origin)
-    try:
-        return WindowsClient(origin)
-    except TypeError:
-        pass
-    for kw in ("origin", "verify_origin", "rp_id"):
+    # OLD API: WindowsClient(origin, handle=hwnd)
+    for attempt in (
+        lambda: WindowsClient(origin, handle=hwnd),
+        lambda: WindowsClient(origin, hwnd),
+        lambda: WindowsClient(origin),
+    ):
         try:
-            return WindowsClient(**{kw: origin})
+            return attempt()
         except TypeError:
             continue
+    for kw in ("origin", "verify_origin", "rp_id"):
+        try:
+            return WindowsClient(**{kw: origin}, handle=hwnd)
+        except TypeError:
+            try:
+                return WindowsClient(**{kw: origin})
+            except TypeError:
+                continue
 
     try:
         sig = inspect.signature(WindowsClient)
@@ -261,8 +299,9 @@ def _make_windows_client(WindowsClient, origin: str):
         sig = "<unknown>"
     raise TypeError(
         f"can't instantiate WindowsClient. Tried new-API "
-        f"(DefaultClientDataCollector wrapper) and old-API (str origin). "
-        f"Signature: {sig}. Send this back to extend the fallbacks."
+        f"(DefaultClientDataCollector wrapper) and old-API (str origin), "
+        f"with and without handle=hwnd. Signature: {sig}. "
+        f"Send this back to extend the fallbacks."
     )
 
 
