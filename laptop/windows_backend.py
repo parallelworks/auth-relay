@@ -219,27 +219,32 @@ def _get_foreground_hwnd():
     HWND = NULL (returns E_ACCESSDENIED, WinError -2147417829). We
     need to hand it a window handle to be the parent of its dialog.
 
-    Try in order:
-      1. user32.GetForegroundWindow()  — whatever window the user is
-         currently looking at (usually their browser in the VDI, but
-         on Windows the foreground is on the laptop side; this is
-         the right semantic for webauthn.dll)
-      2. kernel32.GetConsoleWindow()    — our own console
-    Either gives webauthn.dll a non-NULL hWnd to attach its prompt to.
+    Pwrelay launches the agent as a detached subprocess (no controlling
+    console), so GetConsoleWindow() returns 0 here. GetForegroundWindow()
+    is racy — may return 0 if no window is focused on the user's
+    session at that instant. GetDesktopWindow() always returns a valid
+    HWND; webauthn.dll accepts it as a parent even though the dialog
+    visually attaches to whatever has focus.
+
+    Try in order, log each result. The first non-zero HWND wins.
     """
     import ctypes
-    try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
+    candidates = [
+        ("GetForegroundWindow", lambda: ctypes.windll.user32.GetForegroundWindow()),
+        ("GetConsoleWindow",    lambda: ctypes.windll.kernel32.GetConsoleWindow()),
+        ("GetDesktopWindow",    lambda: ctypes.windll.user32.GetDesktopWindow()),
+        ("GetShellWindow",      lambda: ctypes.windll.user32.GetShellWindow()),
+    ]
+    for name, fn in candidates:
+        try:
+            hwnd = fn()
+        except Exception as e:
+            LOG.warning("HWND probe %s raised: %r", name, e)
+            continue
+        LOG.info("HWND probe %s = %s", name, hwnd)
         if hwnd:
             return hwnd
-    except Exception:
-        pass
-    try:
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            return hwnd
-    except Exception:
-        pass
+    LOG.error("could not resolve any HWND; webauthn.dll will likely refuse with E_ACCESSDENIED")
     return 0
 
 
@@ -257,6 +262,7 @@ def _make_windows_client(WindowsClient, origin: str):
     """
     import inspect
     hwnd = _get_foreground_hwnd()
+    LOG.info("instantiating WindowsClient with hwnd=%s origin=%s", hwnd, origin)
 
     Collector = _import_client_data_collector()
 
