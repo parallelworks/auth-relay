@@ -212,6 +212,42 @@ def _unwrap_assertion_response(r):
     )
 
 
+def _force_hwnd(client) -> None:
+    """Ensure the WindowsClient instance has a non-zero HWND attribute.
+
+    Even if our constructor call passed handle=hwnd, some python-fido2
+    versions ignore it (or initialize hwnd internally to 0). After
+    construction, inspect the client for any attribute that looks like
+    an HWND slot and overwrite it if it's falsy.
+
+    Also logs the relevant attributes so the user can see what
+    python-fido2 actually stored.
+    """
+    hwnd = _get_foreground_hwnd()
+    LOG.info("_force_hwnd: resolved hwnd=%s; will force into client", hwnd)
+    if not hwnd:
+        LOG.error("_force_hwnd: HWND is 0; webauthn.dll WILL reject with E_ACCESSDENIED")
+        return
+    candidates = ("handle", "hwnd", "_handle", "_hwnd", "window_handle", "_window_handle")
+    found = []
+    for attr in candidates:
+        if hasattr(client, attr):
+            current = getattr(client, attr, None)
+            found.append(f"{attr}={current}")
+            try:
+                setattr(client, attr, hwnd)
+            except Exception as e:
+                LOG.warning("could not set %s on client: %r", attr, e)
+    LOG.info("_force_hwnd: existing attrs %s; all set to %s", found, hwnd)
+    # Also list any other attributes that might be related (helps diagnose
+    # which attribute python-fido2 actually consults inside make_credential).
+    related = [a for a in dir(client)
+               if not a.startswith("__")
+               and ("h" == a[0].lower() or "wnd" in a.lower() or "window" in a.lower())]
+    if related:
+        LOG.info("_force_hwnd: other client attrs that may be relevant: %s", related)
+
+
 def _get_foreground_hwnd():
     """Resolve a usable HWND for webauthn.dll's UI parent.
 
@@ -403,6 +439,7 @@ def _make_credential(wa: dict) -> dict:
     )
 
     client = _make_windows_client(WindowsClient, wa["origin"])
+    _force_hwnd(client)
     LOG.info("WindowsClient.make_credential: rp=%s user=%s", rp.get("id"), user.get("name"))
     raw_response = client.make_credential(options)
 
@@ -473,6 +510,7 @@ def _get_assertion(wa: dict) -> dict:
     )
 
     client = _make_windows_client(WindowsClient, wa["origin"])
+    _force_hwnd(client)
     LOG.info("WindowsClient.get_assertion: rpId=%s", wa.get("rpId"))
     raw_response = client.get_assertion(options)
 
